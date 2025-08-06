@@ -1,0 +1,13 @@
+Filename,Filter,Width,Height,Time_ms
+image_1.jpg,sobel,1600,1081,19.18
+image_2.jpg,sobel,1024,1024,10.54
+image_3.jpg,sobel,1600,680,11.71
+image_4.jpg,sobel,1024,768,8.75
+image_5.jpg,sobel,533,799,5.00
+
+Resolution,Average_Time_ms
+533x799,5.00
+1024x768,8.75
+1024x1024,10.54
+1600x680,11.71
+1600x1081,19.18

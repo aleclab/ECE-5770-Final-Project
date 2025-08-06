@@ -1,0 +1,13 @@
+Filename,Filter,Width,Height,Time_ms
+image_1.jpg,gaussian,1600,1081,14.27
+image_2.jpg,gaussian,1024,1024,1.00
+image_3.jpg,gaussian,1600,680,0.96
+image_4.jpg,gaussian,1024,768,1.00
+image_5.jpg,gaussian,533,799,0.00
+
+Resolution,Average_Time_ms
+533x799,0.00
+1024x768,1.00
+1024x1024,1.00
+1600x680,0.96
+1600x1081,14.27
