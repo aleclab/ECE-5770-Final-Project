@@ -10,13 +10,29 @@
 #include <cassert>
 #include <vector>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <math.h>
 #include <cuda.h>
 #include <device_functions.h>
 #include <cuda_runtime_api.h>
+
+#include <chrono>
+#include <fstream>
+
+// ===================== CPU reference implementations =====================
+// All CPU functions accept floats in [0,255] and write floats in [0,255].
+// Layout: interleaved CH channels, row_stride_elems = width*CH.
+// Threads: if built with OpenMP, set threads>1 to use multi-threading;
+//          otherwise they run single-threaded even if threads>1.
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include <vector>
+#include <cmath>
+
+
 
 #define CUDA_CHECK(ans)                                                   \
   { gpuAssert((ans), __FILE__, __LINE__); }
@@ -53,11 +69,14 @@ inline void gpuAssert(cudaError_t code, const char* file, int line,
 // We assume RGB images for this assignment. Change to 1 if running grayscale datasets.
 #define CHANNELS 3
 
-// ----------------------------- Device helpers --------------------------------
 
+/* Utility kernel to ensure comparable outputs to python CV2 */
+/* Mirror image at the border without repeating edge pixel (symettric neighborhood) */
 // OpenCV BORDER_REFLECT_101 index mapping: mirror around edges without repeating the edge pixel.
 // Produces index in [0, n-1].
-__device__ __forceinline__ int reflect101(int p, int n) {
+// Host+device reflect101 so both CPU paths and CUDA kernels can use it.
+__host__ __device__ __forceinline__
+int reflect101(int p, int n) {
     if (n <= 1) return 0;
     int period = 2 * n - 2;
     int t = p % period;
@@ -65,6 +84,188 @@ __device__ __forceinline__ int reflect101(int p, int n) {
     if (t >= n) t = period - t;
     return t;
 }
+
+// Device-side clamp (used in kernels)
+__device__ __forceinline__
+float clamp255(float v) {
+    if (v < 0.0f)   return 0.0f;
+    if (v > 255.0f) return 255.0f;
+    return v;
+}
+
+// Host-side clamp (used in CPU code)
+__host__ __forceinline__
+float clamp255_h(float v) {
+    if (v < 0.0f)   return 0.0f;
+    if (v > 255.0f) return 255.0f;
+    return v;
+}
+
+
+/***************************************************************************/
+/*********************Multi-threaded sequential Start*****************************/
+
+// Single-mask KxK convolution (e.g., Sharpen 3x3)
+template<int K, int CH>
+static void conv2d_single_mask_reflect101_cpu(
+    const float* in, float* out,
+    int width, int height, int row_stride_elems,
+    const float* mask,
+    int threads // 1 for ST, >1 for MT
+) {
+    const int R = K / 2;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int o = y * row_stride_elems + x * CH;
+            for (int c = 0; c < CH; ++c) {
+                float acc = 0.0f;
+                for (int ky = -R; ky <= R; ++ky) {
+                    int iy = reflect101(y + ky, height);
+                    for (int kx = -R; kx <= R; ++kx) {
+                        int ix = reflect101(x + kx, width);
+                        acc += mask[(ky + R) * K + (kx + R)]
+                            * in[iy * row_stride_elems + ix * CH + c];
+                    }
+                }
+                out[o + c] = clamp255_h(acc);
+            }
+        }
+    }
+}
+
+// Fused Sobel: luminance -> L2 magnitude, replicate to CH channels
+template<int K, int CH>
+static void sobel_fused_reflect101_rgb_cpu(
+    const float* in, float* out,
+    int width, int height, int row_stride_elems,
+    const float* kx, const float* ky,
+    int threads
+) {
+    const int R = K / 2;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            double gx = 0.0, gy = 0.0;
+            for (int ky_i = -R; ky_i <= R; ++ky_i) {
+                int iy = reflect101(y + ky_i, height);
+                for (int kx_i = -R; kx_i <= R; ++kx_i) {
+                    int ix = reflect101(x + kx_i, width);
+                    float ypix;
+                    if (CH == 1) {
+                        ypix = in[iy * row_stride_elems + ix * CH + 0];
+                    }
+                    else {
+                        const float r = in[iy * row_stride_elems + ix * CH + 0];
+                        const float g = in[iy * row_stride_elems + ix * CH + 1];
+                        const float b = in[iy * row_stride_elems + ix * CH + 2];
+                        ypix = 0.299f * r + 0.587f * g + 0.114f * b;
+                    }
+                    gx += (double)kx[(ky_i + R) * K + (kx_i + R)] * (double)ypix;
+                    gy += (double)ky[(ky_i + R) * K + (kx_i + R)] * (double)ypix;
+                }
+            }
+            float mag = clamp255_h((float)std::sqrt(gx * gx + gy * gy));
+            int o = y * row_stride_elems + x * CH;
+            for (int c = 0; c < CH; ++c) out[o + c] = mag;
+        }
+    }
+}
+
+// Separable Gaussian 1-D passes (K odd)
+template<int K, int CH>
+static void gauss1d_separable_reflect101_cpu(
+    const float* in, float* out,
+    int width, int height, int row_stride_elems,
+    const float* mask1d, // length K
+    int threads
+) {
+    std::vector<float> tmp((size_t)width * height * CH);
+
+    // Horizontal
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < CH; ++c) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    int ix = reflect101(x + k - K / 2, width);
+                    acc += mask1d[k] * in[y * row_stride_elems + ix * CH + c];
+                }
+                tmp[y * row_stride_elems + x * CH + c] = clamp255_h(acc);
+            }
+        }
+    }
+
+    // Vertical
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < CH; ++c) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    int iy = reflect101(y + k - K / 2, height);
+                    acc += mask1d[k] * tmp[iy * row_stride_elems + x * CH + c];
+                }
+                out[y * row_stride_elems + x * CH + c] = clamp255_h(acc);
+            }
+        }
+    }
+}
+
+
+enum Backend { BK_CUDA, BK_CPU, BK_MT };
+
+static Backend parse_backend(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--backend") && i + 1 < argc) {
+            if (!strcmp(argv[i + 1], "cuda")) return BK_CUDA;
+            if (!strcmp(argv[i + 1], "cpu"))  return BK_CPU;
+            if (!strcmp(argv[i + 1], "mt"))   return BK_MT;
+        }
+        else if (!strncmp(argv[i], "--backend=", 10)) {
+            const char* v = argv[i] + 10;
+            if (!strcmp(v, "cuda")) return BK_CUDA;
+            if (!strcmp(v, "cpu"))  return BK_CPU;
+            if (!strcmp(v, "mt"))   return BK_MT;
+        }
+        // convenience aliases
+        if (!strcmp(argv[i], "--cpu_sobel") || !strcmp(argv[i], "--cpu_sharpen") || !strcmp(argv[i], "--cpu_gaussian"))
+            return BK_CPU;
+        if (!strcmp(argv[i], "--multithread_sobel") || !strcmp(argv[i], "--multithread_sharpen") || !strcmp(argv[i], "--multithread_gaussian"))
+            return BK_MT;
+    }
+    return BK_CUDA;
+}
+
+static int parse_threads(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--threads") && i + 1 < argc) return atoi(argv[i + 1]); // can be 0
+        if (!strncmp(argv[i], "--threads=", 10)) return atoi(argv[i] + 10);           // can be 0
+    }
+#ifdef _OPENMP
+    return 0;  // 0 => auto (use omp_get_max_threads later)
+#else
+    return 1;
+#endif
+}
+
+/***************************************************************************/
+/*********************Multi-threaded sequential End*****************************/
+
+
+// ----------------------------- Device helpers --------------------------------
+
+
+
 
 // Read-only cached load when available
 template <typename T>
@@ -76,12 +277,6 @@ __device__ __forceinline__ T ro(const T* ptr) {
 #endif
 }
 
-// Clamp to 0..255 float
-__device__ __forceinline__ float clamp255(float v) {
-    if (v < 0.0f)   return 0.0f;
-    if (v > 255.0f) return 255.0f;
-    return v;
-}
 
 // In-place scaler for buffers
 __global__ void scale_inplace(float* data, size_t n, float factor) {
@@ -406,9 +601,28 @@ static Op parse_op(int argc, char** argv) {
 
 int main(int argc, char* argv[]) {
     wbArg_t arg = wbArg_read(argc, argv);
-    Op op = parse_op(argc, argv);
+    Op      op = parse_op(argc, argv);
+    Backend backend = parse_backend(argc, argv);
+    int     threads = parse_threads(argc, argv);  // may be 0/None => use all cores
 
-    // Input via wb (floats in [0,1])
+    int nth = 1;
+#ifdef _OPENMP
+    omp_set_dynamic(0);
+    if (backend == BK_MT) {
+        nth = (threads > 0) ? threads : omp_get_max_threads();
+    }
+    else {
+        nth = 1;
+    }
+    omp_set_num_threads(nth);
+    printf("CPU backend: %s, threads=%d (omp_get_max_threads=%d)\n",
+        (backend == BK_MT ? "MT" : "ST"), nth, omp_get_max_threads());
+#else
+    printf("CPU backend: %s, threads=%d (OpenMP not enabled)\n",
+        (backend == BK_MT ? "MT" : "ST"), (backend == BK_MT ? threads : 1));
+#endif
+
+    // ---- Load input via wb (floats in [0,1]) ----
     char* inputImagePath = wbArg_getInputFile(arg, 0);
     wbImage_t inputImage = wbImport(inputImagePath);
     int width = wbImage_getWidth(inputImage);
@@ -423,19 +637,12 @@ int main(int argc, char* argv[]) {
 
     wbImage_t outputImage = wbImage_new(width, height, chans);
     float* h_in = wbImage_getData(inputImage);   // [0,1]
-    float* h_out = wbImage_getData(outputImage);  // will receive [0,1]
+    float* h_out = wbImage_getData(outputImage);  // [0,1] result
 
     const size_t nElems = (size_t)width * height * CHANNELS;
+    const int    row_stride = width * CHANNELS;
 
-    // Device buffers
-    float* d_in = nullptr, * d_out = nullptr;
-    // Sharpen and Sobel masks (3x3)
-    float* d_sharp = nullptr, * d_kx = nullptr, * d_ky = nullptr;
-    // Gaussian
-    float* d_gmask = nullptr; // 1-D length K
-    float* d_tmp = nullptr; // temp buffer for separable passes
-
-    // Host masks
+    // Host masks (shared by CPU/CUDA)
     static const float h_sharpen3[9] = {
         -1.f, -1.f, -1.f,
         -1.f,  9.f, -1.f,
@@ -444,7 +651,111 @@ int main(int argc, char* argv[]) {
     static const float h_sobelX[9] = { -1.f, 0.f, 1.f,  -2.f, 0.f, 2.f,  -1.f, 0.f, 1.f };
     static const float h_sobelY[9] = { 1.f, 2.f, 1.f,   0.f, 0.f, 0.f,  -1.f,-2.f,-1.f };
 
+
+
+    // ========================= CPU / CPU-MT BACKEND =========================
+    if (backend != BK_CUDA) {
+        std::vector<float> in(nElems), out(nElems);
+
+        // Scale input [0,1] -> [0,255]
+        wbTime_start(Compute, "Scale input 0..1 -> 0..255 (CPU)");
+        for (size_t i = 0; i < nElems; ++i) in[i] = h_in[i] * 255.0f;
+        wbTime_stop(Compute, "Scale input 0..1 -> 0..255 (CPU)");
+
+        const bool isMT = (backend == BK_MT);
+        const char* tag = isMT ? " (CPU MT)" : " (CPU)";
+
+#ifdef _OPENMP
+        // Disable dynamic team sizing so we actually use 'nth'.
+        if (isMT) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(nth);
+        }
+#endif
+        if (op == OP_SHARPEN) {
+            std::string lbl = std::string("Sharpen kernel") + tag;
+            wbTime_start(Compute, lbl.c_str());
+            conv2d_single_mask_reflect101_cpu<3, CHANNELS>(
+                in.data(), out.data(), width, height, row_stride, h_sharpen3, nth);
+            wbTime_stop(Compute, lbl.c_str());
+
+        }
+        else if (op == OP_SOBEL) {
+            std::string lbl = std::string("Sobel fused kernel") + tag;
+            wbTime_start(Compute, lbl.c_str());
+            sobel_fused_reflect101_rgb_cpu<3, CHANNELS>(
+                in.data(), out.data(), width, height, row_stride, h_sobelX, h_sobelY, nth);
+            wbTime_stop(Compute, lbl.c_str());
+
+        }
+        else { // OP_GAUSSIAN (5x5 separable) – split into horiz and vert timers
+            std::vector<float> g5;
+            make_gaussian_kernel_1d(5, 0.0, g5); // sigma=0 -> OpenCV rule
+
+            // Horizontal pass: in -> tmp
+            std::vector<float> tmp(nElems);
+            {
+                std::string lbl = std::string("Gaussian horiz") + tag;
+                wbTime_start(Compute, lbl.c_str());
+                // Parallelize over rows if MT
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nth) if(nth>1)
+#endif
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        for (int c = 0; c < CHANNELS; ++c) {
+                            float acc = 0.0f;
+                            for (int k = 0; k < 5; ++k) {
+                                int ix = reflect101(x + k - 2, width);
+                                acc += g5[k] * in[y * row_stride + ix * CHANNELS + c];
+                            }
+                            tmp[y * row_stride + x * CHANNELS + c] = clamp255_h(acc);
+                        }
+                    }
+                }
+                wbTime_stop(Compute, lbl.c_str());
+            }
+            // Vertical pass: tmp -> out
+            {
+                std::string lbl = std::string("Gaussian vert") + tag;
+                wbTime_start(Compute, lbl.c_str());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nth) if(nth>1)
+#endif
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        for (int c = 0; c < CHANNELS; ++c) {
+                            float acc = 0.0f;
+                            for (int k = 0; k < 5; ++k) {
+                                int iy = reflect101(y + k - 2, height);
+                                acc += g5[k] * tmp[iy * row_stride + x * CHANNELS + c];
+                            }
+                            out[y * row_stride + x * CHANNELS + c] = clamp255_h(acc);
+                        }
+                    }
+                }
+                wbTime_stop(Compute, lbl.c_str());
+            }
+        }
+
+        // Scale output back to [0,1]
+        wbTime_start(Compute, "Scale output 0..255 -> 0..1 (CPU)");
+        for (size_t i = 0; i < nElems; ++i) h_out[i] = out[i] * (1.0f / 255.0f);
+        wbTime_stop(Compute, "Scale output 0..255 -> 0..1 (CPU)");
+
+        wbSolution(arg, outputImage);
+        wbImage_delete(outputImage);
+        wbImage_delete(inputImage);
+        return 0;
+    }
+
+    // ============================= CUDA BACKEND =============================
+
     wbTime_start(GPU, "GPU total");
+
+    float* d_in = nullptr, * d_out = nullptr;
+    float* d_sharp = nullptr, * d_kx = nullptr, * d_ky = nullptr;
+    float* d_gmask = nullptr, * d_tmp = nullptr;
 
     // Allocations
     wbTime_start(GPU, "cudaMalloc");
@@ -458,8 +769,8 @@ int main(int argc, char* argv[]) {
         wbCheck(cudaMalloc(&d_ky, 9 * sizeof(float)));
     }
     else { // OP_GAUSSIAN
-        wbCheck(cudaMalloc(&d_gmask, 5 * sizeof(float)));       // K=5
-        wbCheck(cudaMalloc(&d_tmp, nElems * sizeof(float)));  // intermediate
+        wbCheck(cudaMalloc(&d_gmask, 5 * sizeof(float)));
+        wbCheck(cudaMalloc(&d_tmp, nElems * sizeof(float)));
     }
     wbTime_stop(GPU, "cudaMalloc");
 
@@ -473,14 +784,14 @@ int main(int argc, char* argv[]) {
         wbCheck(cudaMemcpy(d_kx, h_sobelX, 9 * sizeof(float), cudaMemcpyHostToDevice));
         wbCheck(cudaMemcpy(d_ky, h_sobelY, 9 * sizeof(float), cudaMemcpyHostToDevice));
     }
-    else { // OP_GAUSSIAN
+    else {
         std::vector<float> g5;
-        make_gaussian_kernel_1d(5, 0.0, g5); // sigma=0 => OpenCV rule
+        make_gaussian_kernel_1d(5, 0.0, g5);
         wbCheck(cudaMemcpy(d_gmask, g5.data(), 5 * sizeof(float), cudaMemcpyHostToDevice));
     }
     wbTime_stop(Copy, "H2D");
 
-    // Scale input [0,1] -> [0,255] to match OpenCV-like numerics
+    // Scale input [0,1] -> [0,255]
     {
         wbTime_start(Compute, "Scale input 0..1 -> 0..255");
         int tpb = 256;
@@ -561,7 +872,7 @@ int main(int argc, char* argv[]) {
         wbTime_stop(Compute, "Gaussian vert");
     }
 
-    // Scale output back to [0,1] for wbSolution
+    // Scale output back to [0,1]
     {
         wbTime_start(Compute, "Scale output 0..255 -> 0..1");
         int tpb = 256;

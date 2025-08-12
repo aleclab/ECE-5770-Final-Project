@@ -6,10 +6,25 @@ import subprocess
 import sys
 from pathlib import Path
 from collections import defaultdict, OrderedDict
-
+import statistics
 import cv2
 import numpy as np
+import os 
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+OP_MARKER = {
+    "sobel": "o",
+    "sharpen": "s",
+    "gaussian": "^",
+}
+BACKEND_COLOR = {
+    "cuda": "C0",
+    "cpu":  "C1",
+    "mt":   "C2",
+}
 
 # ----------------------------- WB timer parsing ------------------------------
 WB_TIMER_SUBSTR = {
@@ -108,7 +123,8 @@ def run_one(exe: Path,
             trailing_comma_in_i: bool,
             extra_i: list[str] | None,
             print_cmd: bool,
-            debug: bool):
+            debug: bool,
+            win_high_prio: bool):
     inputs = [str(input_ppm)]
     if extra_i:
         inputs.extend(extra_i)
@@ -120,7 +136,16 @@ def run_one(exe: Path,
     if print_cmd:
         print("[cmd]", " ".join(cmd))
 
-    out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    # High-priority on Windows only
+    kwargs = {"text": True, "stderr": subprocess.STDOUT}
+    try:
+        import os
+        if win_high_prio and os.name == "nt":
+            kwargs["creationflags"] = subprocess.HIGH_PRIORITY_CLASS
+    except Exception:
+        pass  # fall back silently
+
+    out = subprocess.check_output(cmd, **kwargs)
     correct = RE_CORRECT.search(out) is not None
     t_ms = parse_time_ms(op, out, debug=debug)
     threads_used = parse_threads_used(out)
@@ -160,25 +185,121 @@ def plot_grouped_per_image(op: str, indices, times_by_backend, out_dir: Path):
     plt.close()
     print(f"[plot] wrote {out_path}")
 
-def plot_avg_per_backend(op: str, times_by_backend, out_dir: Path):
-    labels, means = [], []
-    for bk in BACKEND_DISPLAY.keys():
-        series = times_by_backend.get(bk, [])
-        if series:
-            labels.append(BACKEND_DISPLAY[bk])
-            means.append(sum(series)/len(series))
-    if not labels:
+# def plot_avg_per_backend(op: str, times_by_backend, out_dir: Path):
+#     labels, means = [], []
+#     for bk in BACKEND_DISPLAY.keys():
+#         series = times_by_backend.get(bk, [])
+#         if series:
+#             labels.append(BACKEND_DISPLAY[bk])
+#             means.append(sum(series)/len(series))
+#     if not labels:
+#         return
+#     plt.figure()
+#     x = np.arange(len(labels))
+#     plt.bar(x, means)
+#     plt.xticks(x, labels)
+#     plt.title(f"{op}: average kernel time (ms)")
+#     plt.ylabel("time (ms)")
+#     for xi, m in zip(x, means):
+#         plt.text(xi, m, f"{m:.2f}", ha="center", va="bottom")
+#     plt.tight_layout()
+#     out_path = out_dir / f"{op}_avg_by_backend.png"
+#     plt.savefig(out_path)
+#     plt.close()
+#     print(f"[plot] wrote {out_path}")
+
+def compute_backend_stats(op: str, results, backends):
+    # Returns dict: backend -> {"mean": float, "stdev": float, "n": int}
+    stats = {}
+    indices = sorted(results[op].keys())
+    for bk in backends:
+        vals = [results[op][idx].get(bk, {}).get("ms", None) for idx in indices]
+        vals = [v for v in vals if v is not None]
+        if vals:
+            m = sum(vals) / len(vals)
+            s = statistics.stdev(vals) if len(vals) > 1 else 0.0
+            stats[bk] = {"mean": m, "stdev": s, "n": len(vals)}
+    return stats
+
+def plot_avg_per_backend(op: str, stats_by_backend, out_dir: Path):
+    if not stats_by_backend:
+        print(f"[plot] no data to plot for {op}")
         return
-    plt.figure()
+    labels = []
+    means = []
+    stdevs = []
+    ns = []
+    # keep order CUDA, CPU, MT if present
+    for bk in ["cuda", "cpu", "mt"]:
+        if bk in stats_by_backend:
+            labels.append(BACKEND_DISPLAY[bk])
+            means.append(stats_by_backend[bk]["mean"])
+            stdevs.append(stats_by_backend[bk]["stdev"])
+            ns.append(stats_by_backend[bk]["n"])
+
     x = np.arange(len(labels))
-    plt.bar(x, means)
+    plt.figure()
+    plt.bar(x, means, yerr=stdevs, capsize=4)
     plt.xticks(x, labels)
-    plt.title(f"{op}: average kernel time (ms)")
-    plt.ylabel("time (ms)")
-    for xi, m in zip(x, means):
-        plt.text(xi, m, f"{m:.2f}", ha="center", va="bottom")
+    plt.ylabel("algorithm execution time (ms)")
+    plt.title(f"{op}: average algorithm execution time across images (N shown on bars)")
+    for xi, (m, n) in zip(x, zip(means, ns)):
+        plt.text(xi, m, f"{m:.2f}\nN={n}", ha="center", va="bottom")
     plt.tight_layout()
     out_path = out_dir / f"{op}_avg_by_backend.png"
+    plt.savefig(out_path)
+    plt.close()
+    print(f"[plot] wrote {out_path}")
+
+def plot_scatter_time_vs_area(rows, out_path: Path):
+    # rows are dicts with keys: op, backend, time_ms, area
+    xs, ys, cs, ms = [], [], [], []
+    for r in rows:
+        t_str = r.get("time_ms", "")
+        if not t_str:
+            continue
+        try:
+            t = float(t_str)
+        except ValueError:
+            continue
+        area = r.get("area", None)
+        if area is None:
+            continue
+        op = r.get("op", "")
+        bk = r.get("backend", "")
+        xs.append(area)
+        ys.append(t)
+        cs.append(BACKEND_COLOR.get(bk, "C7"))
+        ms.append(OP_MARKER.get(op, "x"))
+
+    if not xs:
+        print("[scatter] no datapoints to plot")
+        return
+
+    plt.figure(figsize=(8, 6))
+    # Plot in groups to get a combined legend (backend color + op marker)
+    # Build proxy artists for legend
+    backend_handles = []
+    for bk, label in BACKEND_DISPLAY.items():
+        backend_handles.append(plt.Line2D([0],[0], color=BACKEND_COLOR.get(bk,"C7"), marker='o', linestyle='None', label=label))
+    op_handles = []
+    for op, marker in OP_MARKER.items():
+        op_handles.append(plt.Line2D([0],[0], color="black", marker=marker, linestyle='None', label=op))
+
+    # Actually scatter: we can just loop and plot individually (fast enough for a few thousand)
+    for x, y, c, m in zip(xs, ys, cs, ms):
+        plt.scatter(x, y, c=c, marker=m, alpha=0.5, s=16, linewidths=0)
+
+    plt.xscale("log")  # area can span orders of magnitude too; comment out if you prefer linear X
+    plt.yscale("log")
+    plt.xlabel("image area (width × height, pixels)")
+    plt.ylabel("algorithm execution time (ms, log scale)")
+    plt.title("algorithm execution time vs image area (color=backend, marker=op)")
+    # Two-part legend
+    leg1 = plt.legend(handles=backend_handles, title="Backend", loc="upper left")
+    plt.gca().add_artist(leg1)
+    plt.legend(handles=op_handles, title="Op", loc="lower right")
+    plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
     print(f"[plot] wrote {out_path}")
@@ -205,6 +326,12 @@ def main():
     ap.add_argument("--csv", default=None, help="Optional path to write a CSV of all runs")
     ap.add_argument("--print-cmd", action="store_true", help="Print each exe command before running")
     ap.add_argument("--debug", action="store_true", help="Print parsed WB timer messages for troubleshooting")
+    ap.add_argument("--scatter", action="store_true",
+                    help="Emit a single scatter plot: time (ms, log) vs image area, colored by backend, shaped by op.")
+    ap.add_argument("--scatter-out", default=None,
+                    help="Output PNG for the scatter plot (default: <plots_dir>/time_vs_area.png)")
+    ap.add_argument("--win-high-priority", action="store_true",
+                help="On Windows, launch the exe with HIGH_PRIORITY_CLASS")
     args = ap.parse_args()
 
     exe = Path(args.exe)
@@ -277,6 +404,7 @@ def main():
                         extra_i=args.extra_i,
                         print_cmd=args.print_cmd,
                         debug=args.debug,
+                        win_high_prio=args.win_high_priority,
                     )
                 except subprocess.CalledProcessError as e:
                     print(f"[err] run failed for idx={idx} op={op} backend={backend}\n{e.output}")
@@ -317,6 +445,7 @@ def main():
                     "correct": int(bool(ok)),
                     "width": w,
                     "height": h,
+                    "area": w * h
                 })
 
             # Pixel-perfect across backends
@@ -333,26 +462,42 @@ def main():
 
     print(f"\nSummary: {n_correct} / {n_total} runs reported correctq:true")
 
-    # Plots
+    # Plots (averages only, per filter)
     plots_dir.mkdir(parents=True, exist_ok=True)
     for op in args.ops:
         indices = sorted(results[op].keys())
-        times_by_backend = {bk: [] for bk in BACKEND_DISPLAY.keys() if bk in args.backends}
-        for idx in indices:
-            for bk in times_by_backend.keys():
-                ms = results[op][idx].get(bk, {}).get("ms", None)
-                times_by_backend[bk].append(ms if ms is not None else 0.0)
 
-        plot_grouped_per_image(op, indices, times_by_backend, plots_dir)
+        # keep a consistent order
+        backend_order = [bk for bk in ["cuda", "cpu", "mt"] if bk in args.backends]
 
-        # averages
-        times_avg = {}
-        for bk in times_by_backend.keys():
-            series = [results[op][idx].get(bk, {}).get("ms", None) for idx in indices]
-            series = [v for v in series if v is not None]
-            if series:
-                times_avg[bk] = series
-        plot_avg_per_backend(op, times_avg, plots_dir)
+        labels, means, stdevs, ns = [], [], [], []
+        for bk in backend_order:
+            vals = [results[op][idx].get(bk, {}).get("ms", None) for idx in indices]
+            vals = [v for v in vals if v is not None]
+            if not vals:
+                continue
+            labels.append(BACKEND_DISPLAY[bk])
+            means.append(float(np.mean(vals)))
+            stdevs.append(float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0)
+            ns.append(len(vals))
+
+        if not labels:
+            print(f"[plot] no data to plot for {op}")
+            continue
+
+        x = np.arange(len(labels))
+        plt.figure()
+        plt.bar(x, means, yerr=stdevs, capsize=4)
+        plt.xticks(x, labels)
+        plt.ylabel("kernel time (ms)")
+        plt.title(f"{op}: average kernel time across images (N shown)")
+        for xi, (m, n) in zip(x, zip(means, ns)):
+            plt.text(xi, m, f"{m:.2f}\nN={n}", ha="center", va="bottom")
+        plt.tight_layout()
+        out_path = plots_dir / f"{op}_avg_by_backend.png"
+        plt.savefig(out_path)
+        plt.close()
+        print(f"[plot] wrote {out_path}")
 
     # CSV
     if args.csv:
@@ -360,12 +505,28 @@ def main():
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "index","image","op","backend","threads_used","time_ms","correct","width","height"
+                "index","image","op","backend","threads_used","time_ms","correct","width","height","area"
             ])
             writer.writeheader()
             for row in rows_for_csv:
                 writer.writerow(row)
         print(f"[csv] wrote {csv_path}")
+
+    # Scatter plot (optional)
+    if args.scatter:
+        scatter_path = Path(args.scatter_out) if args.scatter_out else (plots_dir / "time_vs_area.png")
+        plot_scatter_time_vs_area(rows_for_csv, scatter_path)
+
+    # ---- Thread count summary for MT backend ----
+    for op in args.ops:
+        mt_counts = [int(r["threads_used"]) for r in rows_for_csv
+                     if r["backend"] == "mt" and r.get("op") == op and str(r.get("threads_used","")).isdigit()]
+        if mt_counts:
+            avg = sum(mt_counts) / len(mt_counts)
+            uniq = sorted(set(mt_counts))
+            print(f"[threads] {op}: CPU MT avg={avg:.2f}, unique={uniq}")
+        else:
+            print(f"[threads] {op}: no MT runs (or no thread info parsed)")
 
 if __name__ == "__main__":
     main()
