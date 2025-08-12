@@ -1,8 +1,9 @@
 # ECE 5770 Final Project
 
 TODOs:
-
+- number of images argument 
 - Cache previous "Images/" input argument in a file. Check on execution. If two subsequent launches use identical directories, skip the pre-processing step and reuse original .ppms and such. 
+- Include a new loggable figure in csv, script, .cu - Cuda_total_time - that includes the time taken for transferring data to and from the GPU. I.e. start this timer sometime before the kernel is launched and sometime after it has finished. 
 
 - Further optimzations to CUDA now that we have a robust verification and benchmarking toolchain. Any issues or any improvements achieved would be immediately noticeable. 
 - Execute everything on other NVIDIA enabled computers. I've added .exe to repo so this can easily be one. In theory it should just "work" if the computer's NVIDIA drivers are up to date.. right?
