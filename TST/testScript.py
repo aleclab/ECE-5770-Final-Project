@@ -252,8 +252,12 @@ def plot_avg_per_backend(op: str, stats_by_backend, out_dir: Path):
     print(f"[plot] wrote {out_path}")
 
 def plot_scatter_time_vs_area(rows, out_path: Path):
-    # rows are dicts with keys: op, backend, time_ms, area
-    xs, ys, cs, ms = [], [], [], []
+    # Group points by (backend, op), then scatter once per group (fast).
+    # Also cap total points to keep plotting snappy on huge datasets.
+    import math
+
+    groups = {}  # (bk, op) -> list of (area, time)
+    total = 0
     for r in rows:
         t_str = r.get("time_ms", "")
         if not t_str:
@@ -263,43 +267,75 @@ def plot_scatter_time_vs_area(rows, out_path: Path):
         except ValueError:
             continue
         area = r.get("area", None)
-        if area is None:
+        if area is None or area <= 0 or t <= 0:
             continue
-        op = r.get("op", "")
         bk = r.get("backend", "")
-        xs.append(area)
-        ys.append(t)
-        cs.append(BACKEND_COLOR.get(bk, "C7"))
-        ms.append(OP_MARKER.get(op, "x"))
+        op = r.get("op", "")
+        groups.setdefault((bk, op), []).append((area, t))
+        total += 1
 
-    if not xs:
+    if total == 0:
         print("[scatter] no datapoints to plot")
         return
 
+    # Optional downsample to avoid very slow plots on huge batches
+    MAX_POINTS = 50000
+    if total > MAX_POINTS:
+        # Proportional sampling per group
+        new_groups = {}
+        for key, pts in groups.items():
+            n = len(pts)
+            quota = max(1, int(round(MAX_POINTS * (n / total))))
+            if n <= quota:
+                new_groups[key] = pts
+            else:
+                # uniform sub-sample indices
+                idxs = np.linspace(0, n - 1, quota).astype(int)
+                new_groups[key] = [pts[i] for i in idxs]
+        groups = new_groups
+        total = sum(len(v) for v in groups.values())
+        print(f"[scatter] downsampled to ~{total} points for faster plotting")
+
     plt.figure(figsize=(8, 6))
-    # Plot in groups to get a combined legend (backend color + op marker)
-    # Build proxy artists for legend
-    backend_handles = []
-    for bk, label in BACKEND_DISPLAY.items():
-        backend_handles.append(plt.Line2D([0],[0], color=BACKEND_COLOR.get(bk,"C7"), marker='o', linestyle='None', label=label))
-    op_handles = []
-    for op, marker in OP_MARKER.items():
-        op_handles.append(plt.Line2D([0],[0], color="black", marker=marker, linestyle='None', label=op))
 
-    # Actually scatter: we can just loop and plot individually (fast enough for a few thousand)
-    for x, y, c, m in zip(xs, ys, cs, ms):
-        plt.scatter(x, y, c=c, marker=m, alpha=0.5, s=16, linewidths=0)
+    # Draw one scatter per group
+    for (bk, op), pts in groups.items():
+        if not pts:
+            continue
+        arr = np.asarray(pts, dtype=float)
+        xs, ys = arr[:, 0], arr[:, 1]
+        color = BACKEND_COLOR.get(bk, "C7")
+        marker = OP_MARKER.get(op, "x")
+        plt.scatter(xs, ys, color=color, marker=marker, alpha=0.5, s=16, linewidths=0)
 
-    plt.xscale("log")  # area can span orders of magnitude too; comment out if you prefer linear X
+    # Log scales (guard against non-positive)
+    plt.xscale("log")
     plt.yscale("log")
+
     plt.xlabel("image area (width × height, pixels)")
-    plt.ylabel("algorithm execution time (ms, log scale)")
-    plt.title("algorithm execution time vs image area (color=backend, marker=op)")
-    # Two-part legend
+    plt.ylabel("kernel time (ms, log scale)")
+    plt.title("Kernel time vs image area (color=backend, marker=op)")
+
+    # Legends
+    backend_handles = [
+        plt.Line2D([0], [0], color=BACKEND_COLOR.get(bk, "C7"), marker='o',
+                   linestyle='None', label=label)
+        for bk, label in BACKEND_DISPLAY.items()
+    ]
+    op_handles = [
+        plt.Line2D([0], [0], color="black", marker=marker, linestyle='None', label=op)
+        for op, marker in OP_MARKER.items()
+    ]
     leg1 = plt.legend(handles=backend_handles, title="Backend", loc="upper left")
     plt.gca().add_artist(leg1)
     plt.legend(handles=op_handles, title="Op", loc="lower right")
+
     plt.tight_layout()
+
+    # If a directory path was passed, put a filename in it
+    if out_path.exists() and out_path.is_dir():
+        out_path = out_path / "time_vs_area.png"
+
     plt.savefig(out_path)
     plt.close()
     print(f"[plot] wrote {out_path}")
