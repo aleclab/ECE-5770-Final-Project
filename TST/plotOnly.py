@@ -151,16 +151,46 @@ def plot_avg_per_backend_from_rows(op: str, rows, out_path: Path):
     plt.close()
     print(f"[plot] wrote {out_path}")
 
-def plot_scatter_time_vs_area_from_rows(rows, out_path: Path, max_points_per_group=None):
+def plot_scatter_time_vs_area_from_rows(
+    rows, out_path: Path,
+    max_points_per_group=None,
+    jitter_frac=0.0,            # e.g., 0.02 for ±2% multiplicative jitter on x & y (log-safe)
+    rng_seed=12345              # set None for non-deterministic jitter
+):
     """
-    Faster & clearer scatter:
-      - CPU/MT: color = BACKEND_COLOR, marker = OP_MARKER
-      - CUDA:   color = variant color, marker = variant marker (optional)
-    """
-    groups = {}  # group_key -> {"x": [], "y": []}
-    seen_cuda_variants = set()
-    total_kept = 0
+    Scatter with stable draw order and optional log-safe jitter.
 
+    Marker (shape) encodes OP: sobel/sharpen/gaussian
+    Color encodes backend, EXCEPT CUDA+Sobel variants use distinct variant colors
+    Draw order is fixed: CPU -> MT -> CUDA (plain) -> CUDA v0 -> v1 -> v2 -> v3
+    """
+    # Requires globals: BACKEND_DISPLAY, BACKEND_COLOR, OP_MARKER,
+    # CUDA_VARIANT_COLOR, CUDA_VARIANT_LABEL
+
+    # Key we’ll use to store groups keeps semantics so we can sort consistently:
+    # key = (kind, ident, color, marker, label)
+    #   kind  = "backend" | "cuda_variant"
+    #   ident = "cpu"/"mt"/"cuda"  OR  variant int (0..3)
+    groups = {}
+    seen_ops = set()
+    seen_cpu = False
+    seen_mt = False
+    seen_cuda_plain = False
+    seen_cuda_variants = set()
+
+    if rng_seed is not None and jitter_frac > 0.0:
+        rng = np.random.default_rng(rng_seed)
+    else:
+        rng = None
+
+    def _logsafe_jitter(v):
+        if jitter_frac <= 0.0 or rng is None:
+            return v
+        # multiplicative jitter for log axes: v * exp(u), u ~ U(-a, +a), where a ~ jitter_frac
+        u = rng.uniform(-jitter_frac, +jitter_frac, size=v.shape)
+        return v * np.exp(u)
+
+    total_kept = 0
     for r in rows:
         t = r.get("time_ms", None)
         area = r.get("area", None)
@@ -169,32 +199,45 @@ def plot_scatter_time_vs_area_from_rows(rows, out_path: Path, max_points_per_gro
 
         bk = (r.get("backend") or "").lower()
         op = (r.get("op") or "").lower()
-        cv = r.get("cuda_variant", None)
+        marker = OP_MARKER.get(op, "x")   # shape = operation
+        seen_ops.add(op)
 
-        # Decide group key, color, marker
-        if bk == "cuda" and cv is not None:
-            try:
-                v = int(cv)
-            except Exception:
-                v = None
-
-            if v is not None and v in CUDA_VARIANT_COLOR:
-                color = CUDA_VARIANT_COLOR[v]
-                marker = CUDA_VARIANT_MARKER.get(v, "o")
-                label = CUDA_VARIANT_LABEL.get(v, f"CUDA v{v}")
-                key = ("cuda_variant", v, color, marker, label)
-                seen_cuda_variants.add(v)
+        if bk == "cuda":
+            v = r.get("cuda_variant", None)
+            # CUDA Sobel variants get distinct colors (only meaningful for Sobel)
+            if v is not None and op == "sobel":
+                try:
+                    vi = int(v)
+                except Exception:
+                    vi = None
+                if vi is not None and vi in CUDA_VARIANT_COLOR:
+                    color = CUDA_VARIANT_COLOR[vi]
+                    label = CUDA_VARIANT_LABEL.get(vi, f"CUDA v{vi}")
+                    key = ("cuda_variant", vi, color, marker, label)
+                    seen_cuda_variants.add(vi)
+                else:
+                    color = BACKEND_COLOR.get("cuda", "C0")
+                    label = "CUDA (no variant)"
+                    key = ("backend", "cuda", color, marker, label)
+                    seen_cuda_plain = True
             else:
-                # fallback if variant missing
                 color = BACKEND_COLOR.get("cuda", "C0")
-                marker = OP_MARKER.get(op, "x")
-                label = "CUDA"
+                label = "CUDA (no variant)"
                 key = ("backend", "cuda", color, marker, label)
+                seen_cuda_plain = True
+        elif bk == "cpu":
+            color = BACKEND_COLOR.get("cpu", "C1")
+            label = BACKEND_DISPLAY.get("cpu", "CPU")
+            key = ("backend", "cpu", color, marker, label)
+            seen_cpu = True
+        elif bk == "mt":
+            color = BACKEND_COLOR.get("mt", "C2")
+            label = BACKEND_DISPLAY.get("mt", "CPU MT")
+            key = ("backend", "mt", color, marker, label)
+            seen_mt = True
         else:
-            # CPU / MT (no variants)
-            color = BACKEND_COLOR.get(bk, "C7")
-            marker = OP_MARKER.get(op, "x")
-            label = BACKEND_DISPLAY.get(bk, bk)
+            color = "C7"
+            label = bk or "unknown"
             key = ("backend", bk, color, marker, label)
 
         g = groups.setdefault(key, {"x": [], "y": []})
@@ -206,16 +249,49 @@ def plot_scatter_time_vs_area_from_rows(rows, out_path: Path, max_points_per_gro
         print("[scatter] no datapoints to plot")
         return
 
+    # Fixed, stable draw order
+    def group_sort_key(key):
+        kind, ident, color, marker, label = key
+        if kind == "backend":
+            if ident == "cpu":   pri = (0, 0)
+            elif ident == "mt":  pri = (1, 0)
+            elif ident == "cuda":pri = (2, 0)
+            else:                pri = (9, 0)
+        elif kind == "cuda_variant":
+            # draw variants on top, in numeric order
+            try:
+                pri = (3, int(ident))
+            except Exception:
+                pri = (3, 99)
+        else:
+            pri = (9, 0)
+        return pri
+
+    # Plot
     plt.figure(figsize=(10, 7))
-    for key, data in groups.items():
-        _, _, color, marker, label = key
+    total_plotted = 0
+
+    # Sort groups and assign zorder consistently with sort priority
+    sorted_items = sorted(groups.items(), key=lambda kv: group_sort_key(kv[0]))
+    for order_idx, (key, data) in enumerate(sorted_items):
+        kind, ident, color, marker, label = key
         xs = np.asarray(data["x"], dtype=float)
         ys = np.asarray(data["y"], dtype=float)
+
+        # Optional downsample
         if max_points_per_group is not None and xs.size > max_points_per_group:
             idx = np.linspace(0, xs.size - 1, max_points_per_group).astype(int)
             xs = xs[idx]; ys = ys[idx]
-        plt.scatter(xs, ys, c=color, marker=marker, alpha=0.5, s=16,
-                    linewidths=0, rasterized=True, label=label)
+
+        # Apply reproducible log-safe jitter
+        xs = _logsafe_jitter(xs)
+        ys = _logsafe_jitter(ys)
+
+        # zorder strictly increases with draw priority so later groups are on top
+        z = 10 + order_idx
+        plt.scatter(xs, ys, c=color, marker=marker, alpha=0.55, s=18,
+                    linewidths=0, rasterized=True, zorder=z)
+        total_plotted += xs.size
 
     plt.xscale("log")
     plt.yscale("log")
@@ -223,31 +299,51 @@ def plot_scatter_time_vs_area_from_rows(rows, out_path: Path, max_points_per_gro
     plt.ylabel("kernel time (ms, log scale)")
     plt.title("Kernel time vs image area")
 
-    # Build two legends: (1) CPU/MT backends, (2) CUDA variants actually present
-    # Collect handles by their semantic type from the keys we used above
-    backend_handles, variant_handles = [], []
-    for key in groups.keys():
-        kind, ident, color, marker, label = key
-        handle = plt.Line2D([0], [0], color=color, marker=marker,
-                            linestyle='None', label=label)
-        if kind == "backend" and ident in ("cpu", "mt"):
-            backend_handles.append(handle)
-        elif kind == "cuda_variant":
-            variant_handles.append(handle)
-        elif kind == "backend" and ident == "cuda" and not variant_handles:
-            # fallback if no variants were present
-            variant_handles.append(handle)
-
+    # Legends
+    backend_handles = []
+    if seen_cpu:
+        backend_handles.append(
+            plt.Line2D([0],[0], color=BACKEND_COLOR.get("cpu","C1"), marker='o',
+                       linestyle='None', label=BACKEND_DISPLAY.get("cpu","CPU"))
+        )
+    if seen_mt:
+        backend_handles.append(
+            plt.Line2D([0],[0], color=BACKEND_COLOR.get("mt","C2"), marker='o',
+                       linestyle='None', label=BACKEND_DISPLAY.get("mt","CPU MT"))
+        )
     if backend_handles:
-        leg1 = plt.legend(handles=backend_handles, title="CPU backends", loc="upper left")
+        leg1 = plt.legend(handles=backend_handles, title="CPU backends (color)", loc="upper left")
         plt.gca().add_artist(leg1)
+
+    op_handles = []
+    for op in ("sobel", "sharpen", "gaussian"):
+        if op in seen_ops:
+            op_handles.append(
+                plt.Line2D([0],[0], color="black", marker=OP_MARKER.get(op,"x"),
+                           linestyle='None', label=op)
+            )
+    if op_handles:
+        leg2 = plt.legend(handles=op_handles, title="Ops (marker)", loc="upper center")
+        plt.gca().add_artist(leg2)
+
+    variant_handles = []
+    if seen_cuda_plain:
+        variant_handles.append(
+            plt.Line2D([0],[0], color=BACKEND_COLOR.get("cuda","C0"), marker='o',
+                       linestyle='None', label="CUDA (no variant)")
+        )
+    for v in sorted(seen_cuda_variants):
+        variant_handles.append(
+            plt.Line2D([0],[0], color=CUDA_VARIANT_COLOR.get(v, "C0"), marker='o',
+                       linestyle='None', label=CUDA_VARIANT_LABEL.get(v, f"CUDA v{v}"))
+        )
     if variant_handles:
-        plt.legend(handles=variant_handles, title="CUDA Sobel variants", loc="lower right")
+        plt.legend(handles=variant_handles, title="CUDA Sobel variants (color)", loc="lower right")
 
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
-    print(f"[scatter] plotted {total_kept} points across {len(groups)} groups")
+    print(f"[scatter] plotted {total_plotted} points across {len(groups)} groups")
     print(f"[plot] wrote {out_path}")
 
 def main():
