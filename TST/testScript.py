@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 CUDA_VARIANT_LABEL = {
-    0: "CUDA v0 naive",
+    0: "CUDA v0 original",
     1: "CUDA v1 ro+const",
     2: "CUDA v2 tiled RGB",
     3: "CUDA v3 tiled Y"
