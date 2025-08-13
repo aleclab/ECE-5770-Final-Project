@@ -16,6 +16,10 @@ python prep_and_run_backends.py ^
   --print-cmd --debug
   --scatter --scatter-out "C:\data\plots\time_vs_area.png"
   --win-high-priority 
+  --cuda-include-copies        ^  REM: default, but explicit for clarity
+  --cuda-include-scales           REM: optional, include CUDA scale kernels too
+  --sobel-variants all ^        CUDA Sobel variants to run: 0 1 2 3, or 'all'
+  --skip-prep
 
 NOTE: "--threads 0" = omp_get_max_threads() for multi-threaded workload. Values other than 0 allow optionally selecting number of threads. 
 
@@ -23,9 +27,10 @@ NOTE: "--threads 0" = omp_get_max_threads() for multi-threaded workload. Values 
 
 
 Example usage on Alec's computer:
-python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/5770_Hw1.exe" --images "Images/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/"
+python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/5770_Hw1.exe" --images "Images/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/" --win-high-priority --cuda-include-copies 
 
-python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/5770_Hw1.exe" --images "ImagesSubset/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/" --win-high-priority
+
+python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/5770_Hw1.exe" --images "ImagesSubset/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/" --win-high-priority --cuda-include-copies --sobel-variants all
 
 Debuggin MT:
 python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/5770_Hw1.exe" --images "ImagesSubset/" --dataset "Dataset/" --ops sobel --backends mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/"
