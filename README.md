@@ -4,6 +4,11 @@
 - number of images argument 
 - OpenACC implementation for comparison
 
+- Professor Feedback:
+- Occupancy analysis to improve CUDA performance
+- Include a state-of-the-art open source version of one of the kernels in the testing suite
+- Create and test with still larger images
+
 **In progress:**
 - Further optimzations to CUDA now that we have a robust verification and benchmarking toolchain. Any issues or any improvements achieved would be immediately noticeable. 
 
