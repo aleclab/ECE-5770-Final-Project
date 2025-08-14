@@ -20,11 +20,7 @@
 #include <chrono>
 #include <fstream>
 
-// ===================== CPU reference implementations =====================
-// All CPU functions accept floats in [0,255] and write floats in [0,255].
-// Layout: interleaved CH channels, row_stride_elems = width*CH.
-// Threads: if built with OpenMP, set threads>1 to use multi-threading;
-//          otherwise they run single-threaded even if threads>1.
+
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -69,6 +65,24 @@ inline void gpuAssert(cudaError_t code, const char* file, int line,
 // We assume RGB images for this assignment. Change to 1 if running grayscale datasets.
 #define CHANNELS 3
 
+// ----------------------------- Device helpers --------------------------------
+
+// Read-only cached load when available
+template <typename T>
+__device__ __forceinline__ T ro(const T* ptr) {
+#if __CUDA_ARCH__ >= 350
+    return __ldg(ptr);
+#else
+    return *ptr;
+#endif
+}
+
+
+// In-place scaler for buffers
+__global__ void scale_inplace(float* data, size_t n, float factor) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] *= factor;
+}
 
 /* Utility kernel to ensure comparable outputs to python CV2 */
 /* Mirror image at the border without repeating edge pixel (symettric neighborhood) */
@@ -102,7 +116,11 @@ float clamp255_h(float v) {
 }
 
 
-/***************************************************************************/
+// ===================== CPU reference implementations =====================
+// All CPU functions accept floats in [0,255] and write floats in [0,255].
+// Layout: interleaved CH channels, row_stride_elems = width*CH.
+// Threads: if built with OpenMP, set threads>1 to use multi-threading;
+//          otherwise they run single-threaded even if threads>1.
 /*********************Multi-threaded sequential Start*****************************/
 
 // Single-mask KxK convolution (e.g., Sharpen 3x3)
@@ -258,100 +276,133 @@ static int parse_threads(int argc, char** argv) {
 #endif
 }
 
-/***************************************************************************/
+
 /*********************Multi-threaded sequential End*****************************/
 
+/*********************************************************************************************/
+/*SOBEL exploration. Kernel implemenations with various optimization techniques NOT employed. */
+__constant__ float c_sobelX3x3[9];
+__constant__ float c_sobelY3x3[9];
 
-// ----------------------------- Device helpers --------------------------------
+/* 
+   Uses __restrict__ - allows compiler to assume input pointers are read only, resulst in better instruction scheduling
+       and register allocation
+   
+   no warp divergence on if (CH) statement, not exactly an optimization though
+   proper bounds checking
+   coalesced write pattern. neighboring threads write neighboring pixels
+   read pattern leverages caches well, small 3x3 tile size 
 
-
-
-
-// Read-only cached load when available
-template <typename T>
-__device__ __forceinline__ T ro(const T* ptr) {
-#if __CUDA_ARCH__ >= 350
-    return __ldg(ptr);
-#else
-    return *ptr;
-#endif
-}
-
-
-// In-place scaler for buffers
-__global__ void scale_inplace(float* data, size_t n, float factor) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) data[i] *= factor;
-}
-
-// ----------------------- Single-mask 2D convolution --------------------------
-// Generic per-channel KxK convolution with REFLECT_101 borders.
-// Use this for Sharpen (3x3) or any other single-mask filter.
-
-template<int K, int CH>
-__global__ void conv2d_single_mask_reflect101(
-    const float* __restrict__ d_input,   // interleaved RGB or Gray, in [0,255]
-    float* __restrict__       d_output,  // interleaved, will clamp to [0,255]
-    int width, int height,
-    int in_row_stride_elems,
-    int out_row_stride_elems,
-    const float* __restrict__ d_mask     // K*K
+*/
+__global__ void sobel_v0(
+    const float* __restrict__ d_in,
+    float* __restrict__       d_out,
+    int width, int height, int row_stride_elems, int CH,
+    const float* __restrict__ d_kx,   // 3x3
+    const float* __restrict__ d_ky    // 3x3
 ) {
-    static_assert(K % 2 == 1, "K must be odd");
-    constexpr int R = K / 2;
+    // map output pixels (1 per thread) to 
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    const int sW = TILE_X + K - 1 + SMEM_SKEW; // halo both sides in X
-    const int sH = TILE_Y + K - 1;            // halo both sides in Y
+    // prevent indexing out of bounds
+    if (x >= width || y >= height) return;
 
-    extern __shared__ float smem[];           // CH planes, each sW*sH
-    float* sPlane[CH];
-    {
-        int planeSize = sW * sH;
-        for (int c = 0; c < CH; ++c) sPlane[c] = smem + c * planeSize;
-    }
+    //gx and gy are accumulators for horizontal and vertical gradients 
+    //double used to produce identical output to CV2 reference api
+    double gx = 0.0, gy = 0.0;
+    // accumulate on luminance computed on the fly
 
-    const int bx = blockIdx.x * TILE_X;
-    const int by = blockIdx.y * TILE_Y;
-
-    // Load tile + halo with REFLECT_101
-    for (int sy = threadIdx.y; sy < sH; sy += blockDim.y) {
-        int iy = reflect101(by + sy - R, height);
-        for (int sx = threadIdx.x; sx < sW - SMEM_SKEW; sx += blockDim.x) {
-            int ix = reflect101(bx + sx - R, width);
-            int g = iy * in_row_stride_elems + ix * CH;
-            int s = sy * sW + sx;
-#pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                sPlane[c][s] = ro(&d_input[g + c]);
+    //3x3 grid centered at x,y
+    //if a portion of the neighborhood would be out of bounds, 
+    //   map it back in bounds with border reflect (mirror)
+    for (int ky = -1; ky <= 1; ++ky) {
+        int iy = reflect101(y + ky, height);
+        for (int kx = -1; kx <= 1; ++kx) {
+            int ix = reflect101(x + kx, width);
+            //g base index of input for pixel ix,iy
+            //row_stride_elems = width * channels
+            int g = iy * row_stride_elems + ix * CH;
+            float ypix;
+            //Luminance conversion from input pixel
+            //used to match OpenCV reference API outputs.
+            if (CH == 1) {
+                ypix = d_in[g];
             }
+            else {
+                float r = d_in[g + 0];
+                float gch = d_in[g + 1];
+                float b = d_in[g + 2];
+                ypix = 0.299f * r + 0.587f * gch + 0.114f * b;
+            }
+
+            //apply sobel masks and accumulate 
+            float kxv = d_kx[(ky + 1) * 3 + (kx + 1)];
+            float kyv = d_ky[(ky + 1) * 3 + (kx + 1)];
+            gx += (double)kxv * (double)ypix;
+            gy += (double)kyv * (double)ypix;
         }
     }
-    __syncthreads();
-
-    // Convolution per output pixel
-    int ox = bx + threadIdx.x;
-    int oy = by + threadIdx.y;
-    if (ox < width && oy < height) {
-        const int s0 = threadIdx.y * sW + threadIdx.x;
-        int o = oy * out_row_stride_elems + ox * CH;
-
-#pragma unroll
-        for (int c = 0; c < CH; ++c) {
-            float acc = 0.0f;
-#pragma unroll
-            for (int ky = 0; ky < K; ++ky) {
-#pragma unroll
-                for (int kx = 0; kx < K; ++kx) {
-                    float m = d_mask[ky * K + kx];
-                    acc += m * sPlane[c][s0 + ky * sW + kx];
-                }
-            }
-            d_output[o + c] = clamp255(acc);
-        }
-    }
+    //convert gradient to output magnitude 
+    float mag = clamp255((float)sqrt(gx * gx + gy * gy));
+    int o = y * row_stride_elems + x * CH;
+    for (int c = 0; c < CH; ++c) d_out[o + c] = mag;
 }
+
+__global__ void sobel_v1_ro_const(
+    const float* __restrict__ d_in,
+    float* __restrict__       d_out,
+    int width, int height, int row_stride_elems, int CH
+) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    double gx = 0.0, gy = 0.0;
+
+    for (int ky = -1; ky <= 1; ++ky) {
+        int iy = reflect101(y + ky, height);
+        for (int kx = -1; kx <= 1; ++kx) {
+            int ix = reflect101(x + kx, width);
+            int g = iy * row_stride_elems + ix * CH;
+
+            float ypix;
+            if (CH == 1) {
+#if __CUDA_ARCH__ >= 350
+                float p0 = __ldg(&d_in[g]);
+#else
+                float p0 = d_in[g];
+#endif
+                ypix = p0;
+            }
+            else {
+#if __CUDA_ARCH__ >= 350
+                float r = __ldg(&d_in[g + 0]);
+                float gc = __ldg(&d_in[g + 1]);
+                float b = __ldg(&d_in[g + 2]);
+#else
+                float r = d_in[g + 0];
+                float gc = d_in[g + 1];
+                float b = d_in[g + 2];
+#endif
+                ypix = 0.299f * r + 0.587f * gc + 0.114f * b;
+            }
+
+            float kxv = c_sobelX3x3[(ky + 1) * 3 + (kx + 1)];
+            float kyv = c_sobelY3x3[(ky + 1) * 3 + (kx + 1)];
+            gx += (double)kxv * (double)ypix;
+            gy += (double)kyv * (double)ypix;
+        }
+    }
+
+    float mag = clamp255((float)sqrt(gx * gx + gy * gy));
+    int o = y * row_stride_elems + x * CH;
+    for (int c = 0; c < CH; ++c) d_out[o + c] = mag;
+}
+
 
 // ----------------------------- Fused Sobel -----------------------------------
+// ------------------------------Sobel "V2" ------------------------------------
 // Sobel Gx and Gy on luminance (from RGB), L2 magnitude, replicate to CH channels.
 // REFLECT_101 borders in tile load. Double accumulators to mimic CV_64F.
 
@@ -438,6 +489,156 @@ __global__ void conv2d_sobel_fused_reflect101_rgb(
         }
     }
 }
+
+template<int CH>
+__global__ void sobel_v3_tiled_y(
+    const float* __restrict__ d_in,
+    float* __restrict__       d_out,
+    int width, int height, int row_stride_elems
+) {
+    // K=3 => R=1
+    const int R = 1;
+    const int sW = TILE_X + 3 - 1 + SMEM_SKEW; // halo in X + skew
+    const int sH = TILE_Y + 3 - 1;             // halo in Y
+
+    extern __shared__ float sY[]; // single luminance plane size = sW*sH
+
+    const int bx = blockIdx.x * TILE_X;
+    const int by = blockIdx.y * TILE_Y;
+
+    // Load tile + halo into sY
+    for (int sy = threadIdx.y; sy < sH; sy += blockDim.y) {
+        int iy = reflect101(by + sy - R, height);
+        for (int sx = threadIdx.x; sx < sW - SMEM_SKEW; sx += blockDim.x) {
+            int ix = reflect101(bx + sx - R, width);
+            int g = iy * row_stride_elems + ix * CH;
+
+#if __CUDA_ARCH__ >= 350
+            if (CH == 1) {
+                sY[sy * sW + sx] = __ldg(&d_in[g]);
+            }
+            else {
+                float r = __ldg(&d_in[g + 0]);
+                float gc = __ldg(&d_in[g + 1]);
+                float b = __ldg(&d_in[g + 2]);
+                sY[sy * sW + sx] = 0.299f * r + 0.587f * gc + 0.114f * b;
+            }
+#else
+            if (CH == 1) {
+                sY[sy * sW + sx] = d_in[g];
+            }
+            else {
+                float r = d_in[g + 0];
+                float gc = d_in[g + 1];
+                float b = d_in[g + 2];
+                sY[sy * sW + sx] = 0.299f * r + 0.587f * gc + 0.114f * b;
+            }
+#endif
+        }
+    }
+    __syncthreads();
+
+    int ox = bx + threadIdx.x;
+    int oy = by + threadIdx.y;
+    if (ox < width && oy < height) {
+        int s0 = threadIdx.y * sW + threadIdx.x;
+
+        // double accumulators
+        double gx = 0.0, gy = 0.0;
+
+#pragma unroll
+        for (int ky = 0; ky < 3; ++ky) {
+#pragma unroll
+            for (int kx = 0; kx < 3; ++kx) {
+                float yv = sY[s0 + ky * sW + kx];
+                float kxv = c_sobelX3x3[ky * 3 + kx];
+                float kyv = c_sobelY3x3[ky * 3 + kx];
+                gx += (double)kxv * (double)yv;
+                gy += (double)kyv * (double)yv;
+            }
+        }
+
+        float mag = clamp255((float)sqrt(gx * gx + gy * gy));
+        int o = oy * row_stride_elems + ox * CH;
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            d_out[o + c] = mag;
+        }
+    }
+}
+
+
+/***************************Sobel exploration end ********************************************/
+/*********************************************************************************************/
+
+// ----------------------- Single-mask 2D convolution --------------------------
+// Generic per-channel KxK convolution with REFLECT_101 borders.
+// Use this for Sharpen (3x3) or any other single-mask filter.
+
+template<int K, int CH>
+__global__ void conv2d_single_mask_reflect101(
+    const float* __restrict__ d_input,   // interleaved RGB or Gray, in [0,255]
+    float* __restrict__       d_output,  // interleaved, will clamp to [0,255]
+    int width, int height,
+    int in_row_stride_elems,
+    int out_row_stride_elems,
+    const float* __restrict__ d_mask     // K*K
+) {
+    static_assert(K % 2 == 1, "K must be odd");
+    constexpr int R = K / 2;
+
+    const int sW = TILE_X + K - 1 + SMEM_SKEW; // halo both sides in X
+    const int sH = TILE_Y + K - 1;            // halo both sides in Y
+
+    extern __shared__ float smem[];           // CH planes, each sW*sH
+    float* sPlane[CH];
+    {
+        int planeSize = sW * sH;
+        for (int c = 0; c < CH; ++c) sPlane[c] = smem + c * planeSize;
+    }
+
+    const int bx = blockIdx.x * TILE_X;
+    const int by = blockIdx.y * TILE_Y;
+
+    // Load tile + halo with REFLECT_101
+    for (int sy = threadIdx.y; sy < sH; sy += blockDim.y) {
+        int iy = reflect101(by + sy - R, height);
+        for (int sx = threadIdx.x; sx < sW - SMEM_SKEW; sx += blockDim.x) {
+            int ix = reflect101(bx + sx - R, width);
+            int g = iy * in_row_stride_elems + ix * CH;
+            int s = sy * sW + sx;
+#pragma unroll
+            for (int c = 0; c < CH; ++c) {
+                sPlane[c][s] = ro(&d_input[g + c]);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Convolution per output pixel
+    int ox = bx + threadIdx.x;
+    int oy = by + threadIdx.y;
+    if (ox < width && oy < height) {
+        const int s0 = threadIdx.y * sW + threadIdx.x;
+        int o = oy * out_row_stride_elems + ox * CH;
+
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int ky = 0; ky < K; ++ky) {
+#pragma unroll
+                for (int kx = 0; kx < K; ++kx) {
+                    float m = d_mask[ky * K + kx];
+                    acc += m * sPlane[c][s0 + ky * sW + kx];
+                }
+            }
+            d_output[o + c] = clamp255(acc);
+        }
+    }
+}
+
+
 
 // -------------------------- Separable Gaussian -------------------------------
 // Horizontal and vertical passes, 1D mask length K, per-channel, REFLECT_101.
@@ -599,11 +800,22 @@ static Op parse_op(int argc, char** argv) {
 
 // ------------------------------- main ----------------------------------------
 
+static int parse_cuda_variant(int argc, char** argv) {
+    // 0,1,2,3 (default 2 =  tiled RGB)
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--cuda-variant") && i + 1 < argc) return atoi(argv[i + 1]);
+        if (!strncmp(argv[i], "--cuda-variant=", 15)) return atoi(argv[i] + 15);
+    }
+    return 2;
+}
+
+
 int main(int argc, char* argv[]) {
     wbArg_t arg = wbArg_read(argc, argv);
     Op      op = parse_op(argc, argv);
     Backend backend = parse_backend(argc, argv);
     int     threads = parse_threads(argc, argv);  // may be 0/None => use all cores
+    int sobelVar = parse_cuda_variant(argc, argv);
 
     int nth = 1;
 #ifdef _OPENMP
@@ -789,6 +1001,10 @@ int main(int argc, char* argv[]) {
         make_gaussian_kernel_1d(5, 0.0, g5);
         wbCheck(cudaMemcpy(d_gmask, g5.data(), 5 * sizeof(float), cudaMemcpyHostToDevice));
     }
+    if (op == OP_SOBEL && (sobelVar == 1 || sobelVar == 3)) {
+        wbCheck(cudaMemcpyToSymbol(c_sobelX3x3, h_sobelX, 9 * sizeof(float), 0, cudaMemcpyHostToDevice));
+        wbCheck(cudaMemcpyToSymbol(c_sobelY3x3, h_sobelY, 9 * sizeof(float), 0, cudaMemcpyHostToDevice));
+    }
     wbTime_stop(Copy, "H2D");
 
     // Scale input [0,1] -> [0,255]
@@ -838,11 +1054,37 @@ int main(int argc, char* argv[]) {
     }
     else if (op == OP_SOBEL) {
         wbTime_start(Compute, "Sobel fused kernel");
-        conv2d_sobel_fused_reflect101_rgb<3, CHANNELS> << <grid, block, smem_bytes_conv(3) >> > (
-            d_in, d_out, width, height,
-            width * CHANNELS,
-            d_kx, d_ky
-            );
+        if (sobelVar == 0) {
+            // V0: naive global
+            sobel_v0 << <grid, block >> > (
+                d_in, d_out, width, height, width * CHANNELS, CHANNELS,
+                d_kx, d_ky
+                );
+        }
+        else if (sobelVar == 1) {
+            // V1: ro+const (no smem)
+            sobel_v1_ro_const << <grid, block >> > (
+                d_in, d_out, width, height, width * CHANNELS, CHANNELS
+                );
+        }
+        else if (sobelVar == 2) {
+            // V2: tiled RGB kernel
+            conv2d_sobel_fused_reflect101_rgb<3, CHANNELS> << <grid, block, smem_bytes_conv(3) >> > (
+                d_in, d_out, width, height,
+                width * CHANNELS,
+                d_kx, d_ky
+                );
+        }
+        else { // 3
+            // V3: tiled luminance, single plane
+            size_t smem = (size_t)(TILE_X + 3 - 1 + SMEM_SKEW)
+                * (TILE_Y + 3 - 1)
+                * sizeof(float);
+            sobel_v3_tiled_y<CHANNELS> << <grid, block, smem >> > (
+                d_in, d_out, width, height, width * CHANNELS
+                );
+        }
+
         wbCheck(cudaGetLastError());
         wbCheck(cudaDeviceSynchronize());
         wbTime_stop(Compute, "Sobel fused kernel");
