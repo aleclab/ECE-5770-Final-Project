@@ -43,5 +43,8 @@ python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/577
 python testScript_npp.py --exe "C:/Users/alec7/Desktop/Ece5770/5770finalproj/SRC/5770_Hw1.exe" --images "synth/areaSweepSubset/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/scats/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/" --win-high-priority --cuda-include-copies --sobel-variants all --opensource-compare
 
 
+python testScript_npp.py --exe "C:/Users/alec7/Desktop/Ece5770/5770finalproj/SRC/5770_Hw1.exe" --images "synth/GenImagesFast/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/scats/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/" --win-high-priority --cuda-include-copies --sobel-variants all --opensource-compare
+
+
 PLOT ONLY guide:
-C:\Users\alec7\Desktop\Oakland\ECE 5770\FInal Project\5770finalproj\TST>python plotOnly.py --csv CSV/datum.csv --out-plots Graphs/NewGraphs/ --ops sobel sharpen gaussian --scatter --scatter-out Graphs/NewGraphs
+python plotOnly.py --csv CSV/datum.csv --out-plots Graphs/NewGraphs/ --ops sobel sharpen gaussian --scatter --scatter-out Graphs/NewGraphs
