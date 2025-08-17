@@ -20,6 +20,7 @@
 #include <chrono>
 #include <fstream>
 
+#include <npp.h>
 
 
 #ifdef _OPENMP
@@ -115,6 +116,155 @@ float clamp255_h(float v) {
     return v;
 }
 
+
+// ===================== State of the Art open source reference implementation  =========================
+// uses npp lib
+
+/* Our kernels operate on normalied floats with full dynamic range. */
+/* 32f variatns of open source kernels is most comparable */
+
+
+void npp_gauss5x5_f32_default(const Npp32f* d_src, int srcPitch,
+    Npp32f* d_dst, int dstPitch, int w, int h);
+
+void npp_linear3x3_f32_default(const Npp32f* d_src, int srcPitch,
+    Npp32f* d_dst, int dstPitch, int w, int h,
+    const Npp32f k3x3[3 * 3]);
+
+void npp_sobel3x3_dx_32f(const Npp32f* d_src, int srcPitch,
+    Npp32f* d_dst, int dstPitch, int w, int h);
+
+
+// dx
+static const Npp32f SOBEL_X_3x3[9] = {
+    -1, 0, 1,
+    -2, 0, 2,
+    -1, 0, 1
+};
+// dy
+static const Npp32f SOBEL_Y_3x3[9] = {
+    -1,-2,-1,
+     0, 0, 0,
+     1, 2, 1
+};
+void npp_gauss5x5_f32_default(const Npp32f* d_src, int srcPitch,
+    Npp32f* d_dst, int dstPitch,
+    int w, int h)
+{
+    const NppiSize srcSize{ w, h };
+    const NppiPoint srcOfs{ 0, 0 };
+    const NppiSize roi{ w, h };
+
+    NppStatus st = nppiFilterGaussBorder_32f_C1R(
+        d_src, srcPitch, srcSize, srcOfs,
+        d_dst, dstPitch, roi,
+        NPP_MASK_SIZE_5_X_5, NPP_BORDER_REPLICATE);
+    if (st != NPP_SUCCESS) throw std::runtime_error("nppiFilterGaussBorder_32f_C1R failed");
+}
+
+void npp_linear3x3_f32_default(const Npp32f* d_src, int srcPitch,
+    Npp32f* d_dst, int dstPitch,
+    int w, int h, const Npp32f k3x3[3 * 3])
+{
+    const NppiSize srcSize{ w, h };
+    const NppiPoint srcOfs{ 0, 0 };
+    const NppiSize roi{ w, h };
+    const NppiSize kSize{ 3,3 };
+    const NppiPoint anchor{ 1,1 };
+
+    NppStatus st = nppiFilterBorder_32f_C1R(
+        d_src, srcPitch, srcSize, srcOfs,
+        d_dst, dstPitch, roi,
+        k3x3, kSize, anchor, NPP_BORDER_REPLICATE);
+    if (st != NPP_SUCCESS) throw std::runtime_error("nppiFilterBorder_32f_C1R failed");
+}
+
+void npp_gauss5x5_32f(const Npp32f* d_src, int srcPitch, Npp32f* d_dst, int dstPitch,
+    int w, int h) {
+    NppiSize srcSize{ w, h };
+    NppiPoint srcOfs{ 0, 0 };
+    NppiSize roi{ w, h };
+    auto st = nppiFilterGaussBorder_32f_C1R(
+        d_src, srcPitch, srcSize, srcOfs,
+        d_dst, dstPitch, roi,
+        NPP_MASK_SIZE_5_X_5, NPP_BORDER_REPLICATE);
+    if (st != NPP_SUCCESS) throw std::runtime_error("nppiFilterGaussBorder_32f failed");
+}
+
+void npp_sobel3x3_dx_32f(const Npp32f* d_src, int srcPitch, Npp32f* d_dst, int dstPitch,
+    int w, int h) {
+    NppiSize roi{ w, h };
+    auto st = nppiFilterSobelHoriz_32f_C1R(d_src, srcPitch, d_dst, dstPitch, roi);
+    if (st != NPP_SUCCESS) throw std::runtime_error("nppiFilterSobelHoriz_32f failed");
+}
+
+// pointwise magnitude (float32 in/out). If your app wants 0..1, this stays in float domain.
+__global__ void mag32f_kernel(const float* __restrict__ dx,
+    const float* __restrict__ dy,
+    float* __restrict__ mag,
+    int width, int height, int pitchElems)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int idx = y * pitchElems + x;
+    float gx = dx[idx], gy = dy[idx];
+    mag[idx] = sqrtf(gx * gx + gy * gy);
+}
+
+void npp_sobel_mag3x3_f32(const Npp32f* d_src, int srcPitchBytes,
+    Npp32f* d_dst, int dstPitchBytes, int w, int h)
+{
+    // reuse linear3x3 to get dx/dy, then compute magnitude
+    size_t fPitchB = 0;
+    Npp32f* d_dx = nullptr, * d_dy = nullptr;
+    cudaMallocPitch((void**)&d_dx, &fPitchB, w * sizeof(Npp32f), h);
+    cudaMallocPitch((void**)&d_dy, &fPitchB, w * sizeof(Npp32f), h);
+
+    // dx, dy
+    npp_linear3x3_f32_default(d_src, srcPitchBytes, d_dx, (int)fPitchB, w, h, SOBEL_X_3x3);
+    npp_linear3x3_f32_default(d_src, srcPitchBytes, d_dy, (int)fPitchB, w, h, SOBEL_Y_3x3);
+
+    // mag = hypot(dx,dy)
+    dim3 block(32, 8);
+    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+    mag32f_kernel << <grid, block >> > (d_dx, d_dy, d_dst, w, h, (int)(fPitchB / sizeof(float)));
+    cudaDeviceSynchronize();
+
+    cudaFree(d_dx);
+    cudaFree(d_dy);
+}
+
+// C1: float per pixel
+__global__ void mag_c1(const float* __restrict__ dx,
+    const float* __restrict__ dy,
+    float* __restrict__ out,
+    int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gx = dx[i], gy = dy[i];
+        out[i] = sqrtf(gx * gx + gy * gy);
+    }
+}
+
+// C3: interleaved RGB float per pixel
+__global__ void mag_c3(const float* __restrict__ dx,
+    const float* __restrict__ dy,
+    float* __restrict__ out,
+    int nPixels) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nPixels) {
+        int base = 3 * i;
+        float gx0 = dx[base + 0], gy0 = dy[base + 0];
+        float gx1 = dx[base + 1], gy1 = dy[base + 1];
+        float gx2 = dx[base + 2], gy2 = dy[base + 2];
+        out[base + 0] = sqrtf(gx0 * gx0 + gy0 * gy0);
+        out[base + 1] = sqrtf(gx1 * gx1 + gy1 * gy1);
+        out[base + 2] = sqrtf(gx2 * gx2 + gy2 * gy2);
+    }
+}
+
+// ===================== End =========================
 
 // ===================== CPU reference implementations =====================
 // All CPU functions accept floats in [0,255] and write floats in [0,255].
@@ -811,11 +961,22 @@ static int parse_cuda_variant(int argc, char** argv) {
 
 
 int main(int argc, char* argv[]) {
+    // --- detect if the user asked for NPP explicitly (parse_backend may not know "npp")
+    auto is_backend_str = [&](const char* key)->bool {
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+                return std::strcmp(argv[i + 1], key) == 0;
+            }
+        }
+        return false;
+        };
+    const bool backendIsNPP = is_backend_str("npp");
+
     wbArg_t arg = wbArg_read(argc, argv);
     Op      op = parse_op(argc, argv);
     Backend backend = parse_backend(argc, argv);
     int     threads = parse_threads(argc, argv);  // may be 0/None => use all cores
-    int sobelVar = parse_cuda_variant(argc, argv);
+    int     sobelVar = parse_cuda_variant(argc, argv);
 
     int nth = 1;
 #ifdef _OPENMP
@@ -854,7 +1015,7 @@ int main(int argc, char* argv[]) {
     const size_t nElems = (size_t)width * height * CHANNELS;
     const int    row_stride = width * CHANNELS;
 
-    // Host masks (shared by CPU/CUDA)
+    // Host masks (shared by CPU/CUDA/NPP)
     static const float h_sharpen3[9] = {
         -1.f, -1.f, -1.f,
         -1.f,  9.f, -1.f,
@@ -863,10 +1024,9 @@ int main(int argc, char* argv[]) {
     static const float h_sobelX[9] = { -1.f, 0.f, 1.f,  -2.f, 0.f, 2.f,  -1.f, 0.f, 1.f };
     static const float h_sobelY[9] = { 1.f, 2.f, 1.f,   0.f, 0.f, 0.f,  -1.f,-2.f,-1.f };
 
-
-
     // ========================= CPU / CPU-MT BACKEND =========================
-    if (backend != BK_CUDA) {
+    // (Unchanged) — only runs when NOT CUDA and NOT NPP
+    if ((backend != BK_CUDA) && !backendIsNPP) {
         std::vector<float> in(nElems), out(nElems);
 
         // Scale input [0,1] -> [0,255]
@@ -878,11 +1038,7 @@ int main(int argc, char* argv[]) {
         const char* tag = isMT ? " (CPU MT)" : " (CPU)";
 
 #ifdef _OPENMP
-        // Disable dynamic team sizing so we actually use 'nth'.
-        if (isMT) {
-            omp_set_dynamic(0);
-            omp_set_num_threads(nth);
-        }
+        if (isMT) { omp_set_dynamic(0); omp_set_num_threads(nth); }
 #endif
         if (op == OP_SHARPEN) {
             std::string lbl = std::string("Sharpen kernel") + tag;
@@ -890,7 +1046,6 @@ int main(int argc, char* argv[]) {
             conv2d_single_mask_reflect101_cpu<3, CHANNELS>(
                 in.data(), out.data(), width, height, row_stride, h_sharpen3, nth);
             wbTime_stop(Compute, lbl.c_str());
-
         }
         else if (op == OP_SOBEL) {
             std::string lbl = std::string("Sobel fused kernel") + tag;
@@ -898,18 +1053,15 @@ int main(int argc, char* argv[]) {
             sobel_fused_reflect101_rgb_cpu<3, CHANNELS>(
                 in.data(), out.data(), width, height, row_stride, h_sobelX, h_sobelY, nth);
             wbTime_stop(Compute, lbl.c_str());
-
         }
-        else { // OP_GAUSSIAN (5x5 separable) – split into horiz and vert timers
-            std::vector<float> g5;
-            make_gaussian_kernel_1d(5, 0.0, g5); // sigma=0 -> OpenCV rule
+        else { // OP_GAUSSIAN (5x5 separable)
+            std::vector<float> g5; make_gaussian_kernel_1d(5, 0.0, g5);
 
             // Horizontal pass: in -> tmp
             std::vector<float> tmp(nElems);
             {
                 std::string lbl = std::string("Gaussian horiz") + tag;
                 wbTime_start(Compute, lbl.c_str());
-                // Parallelize over rows if MT
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(nth) if(nth>1)
 #endif
@@ -961,8 +1113,179 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // ============================= CUDA BACKEND =============================
+    // ============================== NPP BACKEND ==============================
+    if (backendIsNPP) {
+        wbTime_start(GPU, "GPU total");
 
+        float* d_in = nullptr, * d_out = nullptr;
+        wbTime_start(GPU, "cudaMalloc");
+        wbCheck(cudaMalloc(&d_in, nElems * sizeof(float)));
+        wbCheck(cudaMalloc(&d_out, nElems * sizeof(float)));
+        wbTime_stop(GPU, "cudaMalloc");
+
+        // H2D
+        wbTime_start(Copy, "H2D");
+        wbCheck(cudaMemcpy(d_in, h_in, nElems * sizeof(float), cudaMemcpyHostToDevice));
+        wbTime_stop(Copy, "H2D");
+
+        // Scale input [0,1] -> [0,255] (on GPU, same labels as CUDA path)
+        {
+            wbTime_start(Compute, "Scale input 0..1 -> 0..255");
+            int tpb = 256;
+            int blks = (int)((nElems + tpb - 1) / tpb);
+            scale_inplace << <blks, tpb >> > (d_in, nElems, 255.0f);
+            wbCheck(cudaGetLastError());
+            wbCheck(cudaDeviceSynchronize());
+            wbTime_stop(Compute, "Scale input 0..1 -> 0..255");
+        }
+
+        const int stepBytesC1 = width * sizeof(float);
+        const int stepBytesC3 = width * CHANNELS * sizeof(float);
+        const NppiSize roi{ width, height };
+
+        if (op == OP_SHARPEN) {
+            // NPP 3x3 linear filter in float32
+            wbTime_start(Compute, "Sharpen kernel");
+            if (CHANNELS == 1) {
+                NppiSize ksz{ 3,3 }; NppiPoint anchor{ 1,1 };
+                NppStatus st = nppiFilterBorder_32f_C1R(
+                    d_in, stepBytesC1, NppiSize{ width,height }, NppiPoint{ 0,0 },
+                    d_out, stepBytesC1, roi,
+                    h_sharpen3, ksz, anchor, NPP_BORDER_REPLICATE);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilterBorder_32f_C1R (sharpen) st=%d\n", st);
+            }
+            else if (CHANNELS == 3) {
+                NppiSize ksz{ 3,3 }; NppiPoint anchor{ 1,1 };
+                NppStatus st = nppiFilterBorder_32f_C3R(
+                    d_in, stepBytesC3, NppiSize{ width,height }, NppiPoint{ 0,0 },
+                    d_out, stepBytesC3, roi,
+                    h_sharpen3, ksz, anchor, NPP_BORDER_REPLICATE);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilterBorder_32f_C3R (sharpen) st=%d\n", st);
+            }
+            else {
+                fprintf(stderr, "[npp] unsupported CHANNELS=%d\n", CHANNELS);
+                cudaFree(d_in); cudaFree(d_out);
+                wbImage_delete(outputImage); wbImage_delete(inputImage);
+                return 1;
+            }
+            wbTime_stop(Compute, "Sharpen kernel");
+
+        }
+        else if (op == OP_SOBEL) {
+            wbTime_start(Compute, "Sobel fused kernel");
+
+            float* d_dx = nullptr, * d_dy = nullptr;
+            wbCheck(cudaMalloc(&d_dx, nElems * sizeof(float)));
+            wbCheck(cudaMalloc(&d_dy, nElems * sizeof(float)));
+
+            NppiSize roi{ width, height };
+            NppiSize ksz{ 3,3 }; NppiPoint anchor{ 1,1 };
+
+            if (CHANNELS == 1) {
+                // dx, dy via NPP 3x3 conv on C1
+                NppStatus st = nppiFilter_32f_C1R(d_in, width * sizeof(float),
+                    d_dx, width * sizeof(float), roi,
+                    h_sobelX, ksz, anchor);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilter_32f_C1R(dx) st=%d\n", st);
+                st = nppiFilter_32f_C1R(d_in, width * sizeof(float),
+                    d_dy, width * sizeof(float), roi,
+                    h_sobelY, ksz, anchor);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilter_32f_C1R(dy) st=%d\n", st);
+
+                // magnitude on CUDA kernel (avoids nppiSqr/Add/Sqrt)
+                int n = width * height, tpb = 256, blks = (n + tpb - 1) / tpb;
+                mag_c1 << <blks, tpb >> > (d_dx, d_dy, d_out, n);
+                wbCheck(cudaGetLastError());
+                wbCheck(cudaDeviceSynchronize());
+
+            }
+            else if (CHANNELS == 3) {
+                // dx, dy via NPP 3x3 conv on C3
+                const int stepBytesC3 = width * CHANNELS * sizeof(float);
+                NppStatus st = nppiFilter_32f_C3R(d_in, stepBytesC3,
+                    d_dx, stepBytesC3, roi,
+                    h_sobelX, ksz, anchor);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilter_32f_C3R(dx) st=%d\n", st);
+                st = nppiFilter_32f_C3R(d_in, stepBytesC3,
+                    d_dy, stepBytesC3, roi,
+                    h_sobelY, ksz, anchor);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilter_32f_C3R(dy) st=%d\n", st);
+
+                // magnitude on CUDA kernel (per-channel)
+                int nPix = width * height, tpb = 256, blks = (nPix + tpb - 1) / tpb;
+                mag_c3 << <blks, tpb >> > (d_dx, d_dy, d_out, nPix);
+                wbCheck(cudaGetLastError());
+                wbCheck(cudaDeviceSynchronize());
+
+            }
+            else {
+                fprintf(stderr, "[npp] unsupported CHANNELS=%d\n", CHANNELS);
+                cudaFree(d_dx); cudaFree(d_dy);
+                cudaFree(d_in); cudaFree(d_out);
+                wbImage_delete(outputImage); wbImage_delete(inputImage);
+                return 1;
+            }
+
+            cudaFree(d_dx);
+            cudaFree(d_dy);
+            wbTime_stop(Compute, "Sobel fused kernel");
+
+        }
+        else { // OP_GAUSSIAN (single-call)
+            wbTime_start(Compute, "Gaussian kernel");
+            if (CHANNELS == 1) {
+                NppStatus st = nppiFilterGaussBorder_32f_C1R(
+                    d_in, stepBytesC1, NppiSize{ width,height }, NppiPoint{ 0,0 },
+                    d_out, stepBytesC1, roi,
+                    NPP_MASK_SIZE_5_X_5, NPP_BORDER_REPLICATE);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilterGaussBorder_32f_C1R st=%d\n", st);
+            }
+            else if (CHANNELS == 3) {
+                NppStatus st = nppiFilterGaussBorder_32f_C3R(
+                    d_in, stepBytesC3, NppiSize{ width,height }, NppiPoint{ 0,0 },
+                    d_out, stepBytesC3, roi,
+                    NPP_MASK_SIZE_5_X_5, NPP_BORDER_REPLICATE);
+                if (st != NPP_SUCCESS) fprintf(stderr, "nppiFilterGaussBorder_32f_C3R st=%d\n", st);
+            }
+            else {
+                fprintf(stderr, "[npp] unsupported CHANNELS=%d\n", CHANNELS);
+                cudaFree(d_in); cudaFree(d_out);
+                wbImage_delete(outputImage); wbImage_delete(inputImage);
+                return 1;
+            }
+            wbTime_stop(Compute, "Gaussian kernel");
+        }
+
+        // Scale output back to [0,1] on GPU (keep labels identical to CUDA path)
+        {
+            wbTime_start(Compute, "Scale output 0..255 -> 0..1");
+            int tpb = 256;
+            int blks = (int)((nElems + tpb - 1) / tpb);
+            scale_inplace << <blks, tpb >> > (d_out, nElems, 1.0f / 255.0f);
+            wbCheck(cudaGetLastError());
+            wbCheck(cudaDeviceSynchronize());
+            wbTime_stop(Compute, "Scale output 0..255 -> 0..1");
+        }
+
+        // D2H and emit
+        wbTime_start(Copy, "D2H");
+        wbCheck(cudaMemcpy(h_out, d_out, nElems * sizeof(float), cudaMemcpyDeviceToHost));
+        wbTime_stop(Copy, "D2H");
+
+        wbTime_stop(GPU, "GPU total");
+
+        wbSolution(arg, outputImage);
+
+        // Cleanup
+        cudaFree(d_in);
+        cudaFree(d_out);
+
+        wbImage_delete(outputImage);
+        wbImage_delete(inputImage);
+        return 0;
+    }
+
+    // ============================= CUDA BACKEND =============================
     wbTime_start(GPU, "GPU total");
 
     float* d_in = nullptr, * d_out = nullptr;
@@ -1055,20 +1378,17 @@ int main(int argc, char* argv[]) {
     else if (op == OP_SOBEL) {
         wbTime_start(Compute, "Sobel fused kernel");
         if (sobelVar == 0) {
-            // V0: naive global
             sobel_v0 << <grid, block >> > (
                 d_in, d_out, width, height, width * CHANNELS, CHANNELS,
                 d_kx, d_ky
                 );
         }
         else if (sobelVar == 1) {
-            // V1: ro+const (no smem)
             sobel_v1_ro_const << <grid, block >> > (
                 d_in, d_out, width, height, width * CHANNELS, CHANNELS
                 );
         }
         else if (sobelVar == 2) {
-            // V2: tiled RGB kernel
             conv2d_sobel_fused_reflect101_rgb<3, CHANNELS> << <grid, block, smem_bytes_conv(3) >> > (
                 d_in, d_out, width, height,
                 width * CHANNELS,
@@ -1076,7 +1396,6 @@ int main(int argc, char* argv[]) {
                 );
         }
         else { // 3
-            // V3: tiled luminance, single plane
             size_t smem = (size_t)(TILE_X + 3 - 1 + SMEM_SKEW)
                 * (TILE_Y + 3 - 1)
                 * sizeof(float);
@@ -1084,14 +1403,12 @@ int main(int argc, char* argv[]) {
                 d_in, d_out, width, height, width * CHANNELS
                 );
         }
-
         wbCheck(cudaGetLastError());
         wbCheck(cudaDeviceSynchronize());
         wbTime_stop(Compute, "Sobel fused kernel");
 
     }
     else { // OP_GAUSSIAN
-        // Horizontal pass: d_in -> d_tmp
         wbTime_start(Compute, "Gaussian horiz");
         gauss1d_horiz_reflect101<5, CHANNELS> << <grid, block, smem_bytes_gauss_h(5) >> > (
             d_in, d_tmp, width, height,
@@ -1102,7 +1419,6 @@ int main(int argc, char* argv[]) {
         wbCheck(cudaDeviceSynchronize());
         wbTime_stop(Compute, "Gaussian horiz");
 
-        // Vertical pass: d_tmp -> d_out
         wbTime_start(Compute, "Gaussian vert");
         gauss1d_vert_reflect101<5, CHANNELS> << <grid, block, smem_bytes_gauss_v(5) >> > (
             d_tmp, d_out, width, height,
