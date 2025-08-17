@@ -36,3 +36,8 @@ python testScript_npp.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release
 
 Debuggin MT:
 python testScript.py --exe "C:/Users/alec7/source/repos/5770_Hw1/x64/Release/5770_Hw1.exe" --images "ImagesSubset/" --dataset "Dataset/" --ops sobel --backends mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/"
+
+
+
+
+python testScript_npp.py --exe "C:/Users/alec7/Desktop/Ece5770/5770finalproj/SRC/5770_Hw1.exe" --images "synth/areaSweepSubset/" --dataset "Dataset/" --ops sobel sharpen gaussian --backends cuda cpu mt --threads 0 --trailing-comma-in-i --out-plots "Graphs/scats/" --csv "CSV/datum.csv" --scatter --scatter-out "Graphs/Scatters/" --win-high-priority --cuda-include-copies --sobel-variants all --opensource-compare
