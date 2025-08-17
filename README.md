@@ -1,8 +1,19 @@
 # ECE 5770 Final Project
 
+**Issues:**
+- npp timing results for sobel not being printed and or captured properly
+
 **TODOs:**
 - number of images argument 
 - OpenACC implementation for comparison
+
+- include information about both processors in report
+- re-run laptop benchmark with threadcount set to something other than default (though it appears to be performing well with 22 threads now?)
+- share gitub with prof
+- Unique scatter plots for each data set to avoid clutter and confusion, i.e. scatter on a per-workflow basis. j
+- apply fixes to logging after desktop benchmark workload is finished
+- retest with compute_89,sm_89 (previously was compute_52,sm_52) which are from Maxwell generation (11 year old PTX, 980ti era)
+- fix double printing of "CUDA" option in scatterplots - adds to clutter problem
 
 - Professor Feedback:
 - Occupancy analysis to improve CUDA performance
