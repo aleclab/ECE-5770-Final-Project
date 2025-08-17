@@ -1,380 +1,355 @@
-# plot_from_csv.py
+# plotOnly.py — Averages + per-op scatters (linear & log-Y) + per-op line graphs (linear & log-Y),
+# incl. NPP, with Sobel generic "CUDA" suppressed when variants present, extra-wide figures,
+# and DISTINCT COLORS for CUDA variants v0..v3.
+
 import argparse
 import csv
 from pathlib import Path
-import numpy as np
+from collections import defaultdict
 import statistics
+import numpy as np
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ---- Display / style mappings (mirror main script) ----
+# ---------- figure sizing ----------
+AVG_DPI         = 130
+SCATTER_DPI     = 150
+LINE_DPI        = 150
+
+AVG_WIDTH_IN    = 7.5
+SCATTER_SIZE_IN = (22, 6.5)   # very wide
+LINE_SIZE_IN    = (22, 6.5)   # very wide
+
+# ---------- Display/style ----------
 BACKEND_DISPLAY = {
+    "cpu": "CPU",
+    "mt": "CPU MT",
     "cuda": "CUDA",
-    "cpu":  "CPU",
-    "mt":   "CPU MT",
+    "cuda_v0": "CUDA v0",
+    "cuda_v1": "CUDA v1",
+    "cuda_v2": "CUDA v2",
+    "cuda_v3": "CUDA v3",
+    "npp": "NPP",
 }
+
+# DISTINCT colors per CUDA variant; avoid collisions with CPU/MT/NPP
+# Palette mostly from matplotlib tab10: blue, purple, red, cyan, plus distinct for generic CUDA
 BACKEND_COLOR = {
-    "cuda": "C0",
-    "cpu":  "C1",
-    "mt":   "C2",
-}
-OP_MARKER = {
-    "sobel":    "o",
-    "sharpen":  "s",
-    "gaussian": "^",
-}
-
-# CUDA variant labeling (keep in sync with your main script)
-CUDA_VARIANT_LABEL = {
-    0: "CUDA v0 (original)",
-    1: "CUDA v1",
-    2: "CUDA v2",
-    3: "CUDA v3",
-}
-CUDA_VARIANT_MARKER = {
-    0: "o",  # circle
-    1: "^",  # triangle
-    2: "s",  # square
-    3: "D",  # diamond
-}
-# distinct colors for variants so they pop, leave CPU/MT as-is
-CUDA_VARIANT_COLOR = {
-    0: "C0",  # blue
-    1: "C3",  # red-ish
-    2: "C4",  # purple-ish
-    3: "C5",  # brown-ish
+    "cpu":     "#7f7f7f",  # gray
+    "mt":      "#2ca02c",  # green
+    "npp":     "#ff7f0e",  # orange
+    "cuda":    "#8c564b",  # brown (generic CUDA when it appears for non-Sobel ops)
+    "cuda_v0": "#1f77b4",  # blue
+    "cuda_v1": "#9467bd",  # purple
+    "cuda_v2": "#d62728",  # red
+    "cuda_v3": "#17becf",  # cyan
 }
 
-def backend_sort_key(key: str):
-    """Order: cuda, cuda_v0..v3, cpu, mt, then anything else."""
-    if key == "cuda":
-        return (0, -1)
-    if key.startswith("cuda_v"):
+BACKEND_MARKER = {
+    "cpu": "s",
+    "mt": "D",
+    "cuda": "o",
+    "cuda_v0": "o",
+    "cuda_v1": "o",
+    "cuda_v2": "o",
+    "cuda_v3": "o",
+    "npp": "^",
+}
+BACKEND_ORDER = ["cpu", "mt", "cuda_v0", "cuda_v1", "cuda_v2", "cuda_v3", "cuda", "npp"]
+OPS_ALLOWED = ("sobel", "sharpen", "gaussian")
+
+def safe_float(x):
+    try: return float(x)
+    except: return None
+
+def safe_int(x):
+    try: return int(x)
+    except: return None
+
+def backend_key_for_row(row: dict) -> str:
+    """Map CSV row to display backend key; split CUDA by variant if present."""
+    b = (row.get("backend") or "").strip().lower()
+    if b == "cuda":
+        cv = row.get("cuda_variant")
+        if cv is None or str(cv).strip() == "":
+            return "cuda"
         try:
-            v = int(key.split("cuda_v", 1)[1])
-        except Exception:
-            v = 99
-        return (1, v)
-    if key == "cpu":
-        return (10, 0)
-    if key == "mt":
-        return (11, 0)
-    return (99, 0)
+            return f"cuda_v{int(cv)}"
+        except:
+            return "cuda"
+    return b
 
-def read_rows(csv_path: Path, ops_filter=None):
+def load_rows(csv_path: Path, ops_filter=None):
     rows = []
-    with open(csv_path, newline="") as f:
-        r = csv.DictReader(f)
-        for rec in r:
-            op = (rec.get("op") or "").strip().lower()
+    with open(csv_path, "r", newline="") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            op = (r.get("op") or "").strip().lower()
             if ops_filter and op not in ops_filter:
                 continue
-            # parse numerics
-            def to_float(s):
-                try:
-                    return float(s)
-                except Exception:
-                    return None
-            def to_int(s):
-                try:
-                    return int(s)
-                except Exception:
-                    return None
-            time_ms = to_float(rec.get("time_ms", ""))
-            width   = to_int(rec.get("width", ""))
-            height  = to_int(rec.get("height", ""))
-            area    = to_int(rec.get("area", ""))
-            threads = to_int(rec.get("threads_used", ""))
-            backend = (rec.get("backend") or "").strip().lower()
-            cv = rec.get("cuda_variant", "")
-            try:
-                cuda_variant = int(cv) if str(cv).strip() != "" else None
-            except Exception:
-                cuda_variant = None
-            rows.append({
+            width  = safe_int(r.get("width"))
+            height = safe_int(r.get("height"))
+            area   = safe_int(r.get("area"))
+            if area is None and width is not None and height is not None:
+                area = width * height
+            cuda_variant = r.get("cuda_variant")
+            cv_parsed = None
+            if cuda_variant not in (None, "", "-"):
+                try: cv_parsed = int(cuda_variant)
+                except: cv_parsed = None
+
+            row = {
+                "index": safe_int(r.get("index")),
+                "image": r.get("image"),
                 "op": op,
-                "backend": backend,
-                "cuda_variant": cuda_variant,
-                "time_ms": time_ms,
-                "width": width, "height": height, "area": area,
-                "threads_used": threads,
-                "image": rec.get("image", ""),
-                "index": rec.get("index", ""),
-                "correct": rec.get("correct", ""),
-            })
+                "backend": (r.get("backend") or "").strip().lower(),
+                "cuda_variant": cv_parsed,
+                "threads_used": safe_int(r.get("threads_used")),
+                "time_ms": safe_float(r.get("time_ms")),
+                "correct": str(r.get("correct","")).strip().lower() in ("1","true","yes"),
+                "width": width,
+                "height": height,
+                "area": area,
+            }
+            row["bk_key"] = backend_key_for_row(row)
+            rows.append(row)
     return rows
 
-def plot_avg_per_backend_from_rows(op: str, rows, out_path: Path):
-    # group times by label (expand CUDA variants if present)
-    times = {}
-    for r in rows:
-        if r["op"] != op:
-            continue
-        t = r["time_ms"]
-        if t is None:
-            continue
-        bk = r["backend"]
-        if bk == "cuda" and r["cuda_variant"] is not None:
-            key = f"cuda_v{r['cuda_variant']}"
-            label = CUDA_VARIANT_LABEL.get(r["cuda_variant"], f"CUDA v{r['cuda_variant']}")
-        else:
-            key = bk
-            label = BACKEND_DISPLAY.get(bk, bk)
-        times.setdefault(key, {"label": label, "vals": []})
-        times[key]["vals"].append(float(t))
+def order_backends(keys):
+    present = sorted(set(keys))
+    present.sort(key=lambda k: (BACKEND_ORDER.index(k) if k in BACKEND_ORDER else 999, k))
+    return present
 
-    if not times:
-        print(f"[plot] no data to plot for {op}")
+def sobel_suppress_generic_cuda(rows_for_op):
+    """If any CUDA variants exist for Sobel, drop generic 'cuda' entries to avoid a 5th series."""
+    has_variants = any(r["backend"]=="cuda" and r.get("cuda_variant") is not None for r in rows_for_op)
+    if has_variants:
+        return [r for r in rows_for_op if not (r["backend"]=="cuda" and r.get("cuda_variant") is None)]
+    return rows_for_op
+
+# ---------- Average plot ----------
+def plot_avg_per_backend(op: str, rows, out_path: Path):
+    rows_op = [r for r in rows if r["op"]==op and r["time_ms"] is not None]
+    if not rows_op:
+        print(f"[plot] skip {op} (no rows)")
         return
+    if op == "sobel":
+        rows_op = sobel_suppress_generic_cuda(rows_op)
 
-    # order keys
-    keys = sorted(times.keys(), key=backend_sort_key)
-    labels = [times[k]["label"] for k in keys]
-    means  = [float(np.mean(times[k]["vals"])) for k in keys]
-    stdevs = [float(np.std(times[k]["vals"], ddof=1)) if len(times[k]["vals"]) > 1 else 0.0 for k in keys]
-    ns     = [len(times[k]["vals"]) for k in keys]
+    times_by_bk = defaultdict(list)
+    for r in rows_op:
+        times_by_bk[r["bk_key"]].append(r["time_ms"])
 
-    # dynamic width so long labels don’t overlap
-    width_in  = max(10.0, 0.9 * len(labels) + 2.0)
-    height_in = 6.0
-    plt.figure(figsize=(width_in, height_in))
-    x = np.arange(len(labels))
-    plt.bar(x, means, yerr=stdevs, capsize=4)
-    plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("kernel time (ms)")
-    plt.title(f"{op}: average kernel time across images (N shown)")
-    for xi, (m, n) in zip(x, zip(means, ns)):
-        plt.text(xi, m, f"{m:.2f}\nN={n}", ha="center", va="bottom")
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    bk_keys = order_backends(times_by_bk.keys())
+    means = [statistics.mean(times_by_bk[k]) for k in bk_keys]
+    ns    = [len(times_by_bk[k]) for k in bk_keys]
+    labels = [BACKEND_DISPLAY.get(k, k.upper()) for k in bk_keys]
+    colors = [BACKEND_COLOR.get(k, "#444444") for k in bk_keys]
+
+    height_per_bar = 0.6
+    fig_height = max(2.8, 1.1 + height_per_bar * len(bk_keys))
+    fig, ax = plt.subplots(figsize=(AVG_WIDTH_IN, fig_height), dpi=AVG_DPI)
+
+    y = np.arange(len(bk_keys))
+    ax.barh(y, means, color=colors, edgecolor="black", alpha=0.9)
+    ax.set_yticks(y, labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("Average time (ms)")
+    ax.set_title(f"{op.capitalize()} — Average time by backend")
+
+    xmax = max(means) if means else 1.0
+    ax.set_xlim(0, xmax * 1.25)
+    for yi, (m, n) in enumerate(zip(means, ns)):
+        ax.text(m * 1.01, yi, f"{m:.2f} ms  (N={n})", va="center", fontsize=9)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.2)
+    plt.close(fig)
     print(f"[plot] wrote {out_path}")
 
-def plot_scatter_time_vs_area_from_rows(
-    rows, out_path: Path,
-    max_points_per_group=None,
-    jitter_frac=0.0,            # e.g., 0.02 for ±2% multiplicative jitter on x & y (log-safe)
-    rng_seed=12345              # set None for non-deterministic jitter
-):
-    """
-    Scatter with stable draw order and optional log-safe jitter.
+# ---------- Per-op scatter (helper) ----------
+def _plot_scatter(rows_op, out_path: Path, title: str, ylog: bool):
+    """Generic scatter writer; assumes rows_op already filtered and sobel-suppressed."""
+    fig, ax = plt.subplots(figsize=SCATTER_SIZE_IN, dpi=SCATTER_DPI)
+    ax.set_title(title)
+    ax.set_xlabel("Image area (pixels)")
+    ax.set_ylabel("Time (ms)")
 
-    Marker (shape) encodes OP: sobel/sharpen/gaussian
-    Color encodes backend, EXCEPT CUDA+Sobel variants use distinct variant colors
-    Draw order is fixed: CPU -> MT -> CUDA (plain) -> CUDA v0 -> v1 -> v2 -> v3
-    """
-    # Requires globals: BACKEND_DISPLAY, BACKEND_COLOR, OP_MARKER,
-    # CUDA_VARIANT_COLOR, CUDA_VARIANT_LABEL
+    by_bk = defaultdict(list)
+    for r in rows_op:
+        by_bk[r["bk_key"]].append(r)
 
-    # Key we’ll use to store groups keeps semantics so we can sort consistently:
-    # key = (kind, ident, color, marker, label)
-    #   kind  = "backend" | "cuda_variant"
-    #   ident = "cpu"/"mt"/"cuda"  OR  variant int (0..3)
-    groups = {}
-    seen_ops = set()
-    seen_cpu = False
-    seen_mt = False
-    seen_cuda_plain = False
-    seen_cuda_variants = set()
-
-    if rng_seed is not None and jitter_frac > 0.0:
-        rng = np.random.default_rng(rng_seed)
-    else:
-        rng = None
-
-    def _logsafe_jitter(v):
-        if jitter_frac <= 0.0 or rng is None:
-            return v
-        # multiplicative jitter for log axes: v * exp(u), u ~ U(-a, +a), where a ~ jitter_frac
-        u = rng.uniform(-jitter_frac, +jitter_frac, size=v.shape)
-        return v * np.exp(u)
-
-    total_kept = 0
-    for r in rows:
-        t = r.get("time_ms", None)
-        area = r.get("area", None)
-        if t is None or area is None or t <= 0 or area <= 0:
+    for bk in order_backends(by_bk.keys()):
+        pts = by_bk[bk]
+        xs = [p["area"] for p in pts if p["area"] is not None and p["time_ms"] is not None]
+        ys = [p["time_ms"] for p in pts if p["area"] is not None and p["time_ms"] is not None]
+        if not xs:
             continue
+        ax.scatter(
+            xs, ys,
+            s=28,
+            marker=BACKEND_MARKER.get(bk, "o"),
+            color=BACKEND_COLOR.get(bk, "#444444"),
+            alpha=0.95,
+            label=BACKEND_DISPLAY.get(bk, bk.upper()),
+            edgecolors="none",
+        )
 
-        bk = (r.get("backend") or "").lower()
-        op = (r.get("op") or "").lower()
-        marker = OP_MARKER.get(op, "x")   # shape = operation
-        seen_ops.add(op)
+    # Log-X if areas span >10x
+    finite_areas = [r["area"] for r in rows_op if r["area"] not in (None, 0)]
+    if finite_areas:
+        amin, amax = min(finite_areas), max(finite_areas)
+        if amin > 0 and (amax / max(amin, 1) >= 10):
+            ax.set_xscale("log")
 
-        if bk == "cuda":
-            v = r.get("cuda_variant", None)
-            # CUDA Sobel variants get distinct colors (only meaningful for Sobel)
-            if v is not None and op == "sobel":
-                try:
-                    vi = int(v)
-                except Exception:
-                    vi = None
-                if vi is not None and vi in CUDA_VARIANT_COLOR:
-                    color = CUDA_VARIANT_COLOR[vi]
-                    label = CUDA_VARIANT_LABEL.get(vi, f"CUDA v{vi}")
-                    key = ("cuda_variant", vi, color, marker, label)
-                    seen_cuda_variants.add(vi)
-                else:
-                    color = BACKEND_COLOR.get("cuda", "C0")
-                    label = "CUDA (no variant)"
-                    key = ("backend", "cuda", color, marker, label)
-                    seen_cuda_plain = True
-            else:
-                color = BACKEND_COLOR.get("cuda", "C0")
-                label = "CUDA (no variant)"
-                key = ("backend", "cuda", color, marker, label)
-                seen_cuda_plain = True
-        elif bk == "cpu":
-            color = BACKEND_COLOR.get("cpu", "C1")
-            label = BACKEND_DISPLAY.get("cpu", "CPU")
-            key = ("backend", "cpu", color, marker, label)
-            seen_cpu = True
-        elif bk == "mt":
-            color = BACKEND_COLOR.get("mt", "C2")
-            label = BACKEND_DISPLAY.get("mt", "CPU MT")
-            key = ("backend", "mt", color, marker, label)
-            seen_mt = True
-        else:
-            color = "C7"
-            label = bk or "unknown"
-            key = ("backend", bk, color, marker, label)
+    # Optional log-Y version
+    if ylog:
+        pos_times = [r["time_ms"] for r in rows_op if r["time_ms"] and r["time_ms"] > 0]
+        if pos_times:
+            ax.set_yscale("log")
 
-        g = groups.setdefault(key, {"x": [], "y": []})
-        g["x"].append(float(area))
-        g["y"].append(float(t))
-        total_kept += 1
+    ax.grid(True, which="both", linestyle=":", alpha=0.35)
+    ax.legend(loc="best", frameon=True, fontsize=10, ncols=1)
+    fig.tight_layout()
 
-    if not groups:
-        print("[scatter] no datapoints to plot")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+    print(f"[scatter] wrote {out_path}")
+
+# ---------- Per-op line (helper) ----------
+def _plot_line(rows_op, out_path: Path, title: str, ylog: bool):
+    """Line graph: per backend, connect points sorted by area."""
+    fig, ax = plt.subplots(figsize=LINE_SIZE_IN, dpi=LINE_DPI)
+    ax.set_title(title)
+    ax.set_xlabel("Image area (pixels)")
+    ax.set_ylabel("Time (ms)")
+
+    by_bk = defaultdict(list)
+    for r in rows_op:
+        if r["area"] is None or r["time_ms"] is None:
+            continue
+        by_bk[r["bk_key"]].append((r["area"], r["time_ms"]))
+
+    any_series = False
+    for bk in order_backends(by_bk.keys()):
+        pts = by_bk[bk]
+        if not pts:
+            continue
+        pts.sort(key=lambda t: t[0])  # sort by area
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        any_series = True
+        ax.plot(
+            xs, ys,
+            marker=BACKEND_MARKER.get(bk, "o"),
+            linewidth=1.8,
+            markersize=4.5,
+            color=BACKEND_COLOR.get(bk, "#444444"),
+            alpha=0.95,
+            label=BACKEND_DISPLAY.get(bk, bk.upper()),
+        )
+
+    if not any_series:
+        plt.close(fig)
         return
 
-    # Fixed, stable draw order
-    def group_sort_key(key):
-        kind, ident, color, marker, label = key
-        if kind == "backend":
-            if ident == "cpu":   pri = (0, 0)
-            elif ident == "mt":  pri = (1, 0)
-            elif ident == "cuda":pri = (2, 0)
-            else:                pri = (9, 0)
-        elif kind == "cuda_variant":
-            # draw variants on top, in numeric order
-            try:
-                pri = (3, int(ident))
-            except Exception:
-                pri = (3, 99)
-        else:
-            pri = (9, 0)
-        return pri
+    # Log-X if areas span >10x
+    finite_areas = [r["area"] for r in rows_op if r["area"] not in (None, 0)]
+    if finite_areas:
+        amin, amax = min(finite_areas), max(finite_areas)
+        if amin > 0 and (amax / max(amin, 1) >= 10):
+            ax.set_xscale("log")
 
-    # Plot
-    plt.figure(figsize=(10, 7))
-    total_plotted = 0
+    # Optional log-Y
+    if ylog:
+        pos_times = [r["time_ms"] for r in rows_op if r["time_ms"] and r["time_ms"] > 0]
+        if pos_times:
+            ax.set_yscale("log")
 
-    # Sort groups and assign zorder consistently with sort priority
-    sorted_items = sorted(groups.items(), key=lambda kv: group_sort_key(kv[0]))
-    for order_idx, (key, data) in enumerate(sorted_items):
-        kind, ident, color, marker, label = key
-        xs = np.asarray(data["x"], dtype=float)
-        ys = np.asarray(data["y"], dtype=float)
+    ax.grid(True, which="both", linestyle=":", alpha=0.35)
+    ax.legend(loc="best", frameon=True, fontsize=10, ncols=1)
+    fig.tight_layout()
 
-        # Optional downsample
-        if max_points_per_group is not None and xs.size > max_points_per_group:
-            idx = np.linspace(0, xs.size - 1, max_points_per_group).astype(int)
-            xs = xs[idx]; ys = ys[idx]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+    print(f"[line] wrote {out_path}")
 
-        # Apply reproducible log-safe jitter
-        xs = _logsafe_jitter(xs)
-        ys = _logsafe_jitter(ys)
+# ---------- Per-op (public) ----------
+def plot_scatter_and_lines_per_op(rows, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for op in OPS_ALLOWED:
+        rows_op = [r for r in rows if r["op"]==op and r["time_ms"] is not None and r["area"] is not None]
+        if not rows_op:
+            print(f"[scatter/line] skip {op} (no rows)")
+            continue
+        if op == "sobel":
+            rows_op = sobel_suppress_generic_cuda(rows_op)
 
-        # zorder strictly increases with draw priority so later groups are on top
-        z = 10 + order_idx
-        plt.scatter(xs, ys, c=color, marker=marker, alpha=0.55, s=18,
-                    linewidths=0, rasterized=True, zorder=z)
-        total_plotted += xs.size
-
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.xlabel("image area (width × height, pixels)")
-    plt.ylabel("kernel time (ms, log scale)")
-    plt.title("Kernel time vs image area")
-
-    # Legends
-    backend_handles = []
-    if seen_cpu:
-        backend_handles.append(
-            plt.Line2D([0],[0], color=BACKEND_COLOR.get("cpu","C1"), marker='o',
-                       linestyle='None', label=BACKEND_DISPLAY.get("cpu","CPU"))
+        # Scatter: linear & log-Y
+        _plot_scatter(
+            rows_op,
+            out_dir / f"{op}_time_vs_area_linear.png",
+            f"{op.capitalize()} — Time vs. Pixels (linear Y)",
+            ylog=False
         )
-    if seen_mt:
-        backend_handles.append(
-            plt.Line2D([0],[0], color=BACKEND_COLOR.get("mt","C2"), marker='o',
-                       linestyle='None', label=BACKEND_DISPLAY.get("mt","CPU MT"))
+        _plot_scatter(
+            rows_op,
+            out_dir / f"{op}_time_vs_area_logy.png",
+            f"{op.capitalize()} — Time vs. Pixels (log Y)",
+            ylog=True
         )
-    if backend_handles:
-        leg1 = plt.legend(handles=backend_handles, title="CPU backends (color)", loc="upper left")
-        plt.gca().add_artist(leg1)
 
-    op_handles = []
-    for op in ("sobel", "sharpen", "gaussian"):
-        if op in seen_ops:
-            op_handles.append(
-                plt.Line2D([0],[0], color="black", marker=OP_MARKER.get(op,"x"),
-                           linestyle='None', label=op)
-            )
-    if op_handles:
-        leg2 = plt.legend(handles=op_handles, title="Ops (marker)", loc="upper center")
-        plt.gca().add_artist(leg2)
-
-    variant_handles = []
-    if seen_cuda_plain:
-        variant_handles.append(
-            plt.Line2D([0],[0], color=BACKEND_COLOR.get("cuda","C0"), marker='o',
-                       linestyle='None', label="CUDA (no variant)")
+        # Line: linear & log-Y
+        _plot_line(
+            rows_op,
+            out_dir / f"{op}_time_vs_area_line_linear.png",
+            f"{op.capitalize()} — Time vs. Pixels (line, linear Y)",
+            ylog=False
         )
-    for v in sorted(seen_cuda_variants):
-        variant_handles.append(
-            plt.Line2D([0],[0], color=CUDA_VARIANT_COLOR.get(v, "C0"), marker='o',
-                       linestyle='None', label=CUDA_VARIANT_LABEL.get(v, f"CUDA v{v}"))
+        _plot_line(
+            rows_op,
+            out_dir / f"{op}_time_vs_area_line_logy.png",
+            f"{op.capitalize()} — Time vs. Pixels (line, log Y)",
+            ylog=True
         )
-    if variant_handles:
-        plt.legend(handles=variant_handles, title="CUDA Sobel variants (color)", loc="lower right")
 
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    print(f"[scatter] plotted {total_plotted} points across {len(groups)} groups")
-    print(f"[plot] wrote {out_path}")
-
+# ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Plot averages and scatter from benchmarking CSV.")
-    ap.add_argument("--csv", required=True, help="Path to CSV produced by test script")
-    ap.add_argument("--out-plots", default=".", help="Directory to save plots")
-    ap.add_argument("--ops", nargs="+", default=["gaussian","sobel","sharpen"],
-                    help="Subset of ops to plot")
-    ap.add_argument("--scatter", action="store_true", help="Also make the time-vs-area scatter plot")
-    ap.add_argument("--scatter-out", default=None,
-                    help="Output PNG for the scatter plot (default: <plots_dir>/time_vs_area.png)")
+    ap = argparse.ArgumentParser(description="Plot averages and per-op scatters/lines from CSV (incl. NPP).")
+    ap.add_argument("--csv", required=True, help="Input CSV file.")
+    ap.add_argument("--out-plots", required=True, help="Directory for avg plots (and scatters/lines if --scatter-out not set).")
+    ap.add_argument("--ops", nargs="+", default=list(OPS_ALLOWED), help="Subset of ops: sobel sharpen gaussian")
+    ap.add_argument("--scatter", action="store_true", help="Also write scatters/lines per op (linear & log-Y).")
+    ap.add_argument("--scatter-out", default=None, help="Optional different directory for scatter/line plots.")
     args = ap.parse_args()
 
     csv_path = Path(args.csv)
     plots_dir = Path(args.out_plots)
+    scat_dir = Path(args.scatter_out) if args.scatter_out else plots_dir
+
+    if not csv_path.is_file():
+        raise SystemExit(f"[err] CSV not found: {csv_path}")
     plots_dir.mkdir(parents=True, exist_ok=True)
+    scat_dir.mkdir(parents=True, exist_ok=True)
 
-    ops_filter = [o.lower() for o in args.ops]
-    rows = read_rows(csv_path, ops_filter=ops_filter)
+    ops_filter = [o for o in args.ops if o in OPS_ALLOWED]
+    rows = load_rows(csv_path, ops_filter=ops_filter)
+    if not rows:
+        print("[warn] no rows to plot.")
+        return
 
-    # Per-op average charts
+    # Average bars
     for op in ops_filter:
-        out_path = plots_dir / f"{op}_avg_by_backend.png"
-        plot_avg_per_backend_from_rows(op, rows, out_path)
+        plot_avg_per_backend(op, rows, plots_dir / f"{op}_avg_by_backend.png")
 
-    # Scatter (optional)
+    # Scatters + Lines
     if args.scatter:
-        scatter_path = Path(args.scatter_out) if args.scatter_out else (plots_dir / "time_vs_area.png")
-        if scatter_path.is_dir():
-            scatter_path = scatter_path / "time_vs_area.png"
-        plot_scatter_time_vs_area_from_rows(rows, scatter_path)
+        plot_scatter_and_lines_per_op(rows, scat_dir)
 
 if __name__ == "__main__":
     main()
