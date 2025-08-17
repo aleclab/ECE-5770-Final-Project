@@ -10,6 +10,7 @@ rem ===================================
 set "IN=%DS%\input%IDX%.ppm"
 set "EXP=%DS%\expected_sobel.ppm"
 set "LOG=%USERPROFILE%\Desktop\sobel_npp_%IDX%.txt"
+set CUDA_LAUNCH_BLOCKING=1
 
 echo [INFO] EXE: "%EXE%"
 echo [INFO] IN : "%IN%"
@@ -38,5 +39,5 @@ rem --- look specifically for the timer label
 findstr /i /c:"Sobel fused kernel" "%LOG%"
 echo [INFO] Opening log...
 start "" notepad "%LOG%"
-
+set CUDA_LAUNCH_BLOCKING=
 pause
