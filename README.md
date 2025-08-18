@@ -1,16 +1,16 @@
 # ECE 5770 Final Project
 
 **Professor Feedback:**
-- Include a state-of-the-art open source version of one of the kernels in the testing suite. Could be issues with our implementation that makes multithread appear performant in comparison.
+1. Include a state-of-the-art open source version of one of the kernels in the testing suite. Could be issues with our implementation that makes multithread appear performant in comparison.
 - **Follow-up:** Incorporated comparable npp (Nvidia Performance Primitives) API calls in testing. Similar performance! 
 
-- Occupancy analysis to improve CUDA performance
+2. Occupancy analysis to improve CUDA performance
 - **Follow-up:** Supposedly the npp APIs we tested with handle occupancy calculations automatically, and the timing performance of these APIs for the test image set was comparable to our CUDA. This should rule out occupancy inefficiencies as an explanation for any perceived CUDA performance shortcomings. 
 
-- Create and test with still larger images
+3. Create and test with still larger images
 - **Follow-up:** Attempted to do this. At around 10^9 pixels, encountered issues creating .jpgs of that size with scripts (very slow, consumes 100% RAM, crash). Tried resolving speed issue with multiple "workers' in Python, but forgot about RAM consumption and it casued Windows to crash. Relatedly, decompressing the extremely large, synthetic .jpg files into .ppm files consumes a massive amount of disk space. I dedicated ~600gb to the images used for Batch1 and Batch2 testing. 
 
-- Explore varying image mask sizes.
+4. Explore varying image mask sizes.
 - **Follow-up:** Did not explore this. 
 
 *********************************************************************************************
