@@ -65,6 +65,37 @@ WB_TIMER_SUBSTR_NPP = {
 RE_CORRECT = re.compile(r'"correctq"\s*:\s*true', re.IGNORECASE)
 RE_THREADS = re.compile(r"threads\s*=\s*(\d+)", re.IGNORECASE)
 
+
+def read_image_huge(path: str, flags=None):
+    """
+    Try OpenCV first with the given flags (default COLOR),
+    fall back to Pillow for ultra-large images, then convert to BGR uint8.
+    """
+    import cv2
+    if flags is None:
+        flags = cv2.IMREAD_COLOR
+    try:
+        img = cv2.imread(path, flags)
+        if img is not None:
+            return img
+    except cv2.error:
+        pass  # fall through to Pillow
+
+    # Pillow fallback (disable its own safety cap)
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    im = Image.open(path)
+    if flags == cv2.IMREAD_GRAYSCALE:
+        if im.mode != "L":
+            im = im.convert("L")
+        arr = np.array(im, dtype=np.uint8)
+        return arr
+    else:
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        arr = np.array(im, dtype=np.uint8)  # RGB
+        return arr[:, :, ::-1].copy()       # RGB->BGR (OpenCV convention)
+
 def parse_wb_timers_all(text: str):
     out = []
     for line in text.splitlines():
@@ -548,7 +579,7 @@ def main():
 
         print("[prep] building dataset folders and expected outputs...")
         for idx, src in enumerate(files, start=args.start_idx):
-            img = cv2.imread(str(src))
+            img = read_image_huge(str(src))
             if img is None:
                 print(f"[warn] failed to read {src}, skipping"); continue
             h, w = img.shape[:2]
