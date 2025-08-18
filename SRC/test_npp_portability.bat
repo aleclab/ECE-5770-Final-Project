@@ -1,7 +1,7 @@
 @echo on
 setlocal EnableExtensions
 
-rem ====== EDIT THESE THREE ONLY ======
+rem ===================================
 set "EXE=C:\Users\alec7\Desktop\Ece5770\5770finalproj\SRC\5770_Hw1.exe"
 set "IDX=0"
 set "DS=C:\Users\alec7\Desktop\Ece5770\5770finalproj\TST\Dataset\0\"
