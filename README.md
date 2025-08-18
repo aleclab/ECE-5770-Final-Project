@@ -1,32 +1,30 @@
 # ECE 5770 Final Project
 
+**Professor Feedback:**
+- Include a state-of-the-art open source version of one of the kernels in the testing suite. Could be issues with our implementation that makes multithread appear performant in comparison.
+- **Follow-up:** Incorporated comparable npp (Nvidia Performance Primitives) API calls in testing. Similar performance! 
+
+- Occupancy analysis to improve CUDA performance
+- **Follow-up:** Supposedly the npp APIs we tested with handle occupancy calculations automatically, which should theoretically rule out any occupancy inefficiencies from invalidating CUDA vs MT performance comparison. 
+
+- Create and test with still larger images
+- **Follow-up:** Attempted to do this. At around 10^9 pixels, encountered issues creating .jpgs of that size with scripts (very slow, consumes 100% RAM, crash). Tried resolving speed issue with multiple "workers' in Python, but forgot about RAM consumption and it casued Windows to crash. Relatedly, decompressing the extremely large, synthetic .jpg files into .ppm files consumes a massive amount of disk space. I dedicated ~600gb to the images used for Batch1 and Batch2 testing. 
+
+- Explore varying image mask sizes.
+- **Follow-up:** Did not explore this. 
+
+*********************************************************************************************
 **Issues:**
-- npp timing results for sobel not being printed and or captured properly
 
 **TODOs:**
 - number of images argument 
 - OpenACC implementation for comparison
 
-- include information about both processors in report
-- re-run laptop benchmark with threadcount set to something other than default (though it appears to be performing well with 22 threads now?)
-- share gitub with prof
-- Unique scatter plots for each data set to avoid clutter and confusion, i.e. scatter on a per-workflow basis. j
-- apply fixes to logging after desktop benchmark workload is finished
-- retest with compute_89,sm_89 (previously was compute_52,sm_52) which are from Maxwell generation (11 year old PTX, 980ti era)
-- fix double printing of "CUDA" option in scatterplots - adds to clutter problem
-
-- Professor Feedback:
-- Occupancy analysis to improve CUDA performance
-- Include a state-of-the-art open source version of one of the kernels in the testing suite
-- Create and test with still larger images
-
 **In progress:**
 - Further optimzations to CUDA now that we have a robust verification and benchmarking toolchain. Any issues or any improvements achieved would be immediately noticeable. 
-
-- Potentially benchmark python execution during data prep phase for another sequential bulletpoint, but also that might be accelerated under the hood. 
 - Execute everything on other NVIDIA enabled computers. 
 
-**Done:**
+**Done:** (non-exaustive) 
 - introduced variants of Sobel kernel with various optimization techniques employed and/or omitted to investigate performance impact. 
 - multithreaded C/C++ implementation with timing benchmarks for comparison. Makes use of OpenMP. 
 - graph avg runtimes against pixel counts for all 3x3 datapoints (scatterplot maybe)
@@ -38,3 +36,5 @@
 - introduced copies of extremely small and extremely large images in the dataset to tease out any performance differences at extremes 
 - extremely large and extremely small images to help with graph 
 - Versions of kernels with certain optimization techniques NOT used to demonstrate impact
+- Per-filter scatter charts to improve readability and other graphing improvements in plotOnly.py (run after main test - didn't get time to update main script). Line displayed on scatter, now produces linear & log scaled y-axis versions of scatter, and no longer erroneously lists a 5th sobel variants. 
+- Retested with compute_89,sm_89 (previously was compute_52,sm_52) which are from Maxwell generation (11 year old PTX, 980ti era). Intended to address a cudaSynch failure on laptop but it did not. Didn't notice a performance difference either. 
