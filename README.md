@@ -5,7 +5,7 @@
 - **Follow-up:** Incorporated comparable npp (Nvidia Performance Primitives) API calls in testing. Similar performance! 
 
 - Occupancy analysis to improve CUDA performance
-- **Follow-up:** Supposedly the npp APIs we tested with handle occupancy calculations automatically, which should theoretically rule out any occupancy inefficiencies from invalidating CUDA vs MT performance comparison. 
+- **Follow-up:** Supposedly the npp APIs we tested with handle occupancy calculations automatically, which should rule out occupancy inefficiencies as an explanation for CUDA performance comparisons to MT.
 
 - Create and test with still larger images
 - **Follow-up:** Attempted to do this. At around 10^9 pixels, encountered issues creating .jpgs of that size with scripts (very slow, consumes 100% RAM, crash). Tried resolving speed issue with multiple "workers' in Python, but forgot about RAM consumption and it casued Windows to crash. Relatedly, decompressing the extremely large, synthetic .jpg files into .ppm files consumes a massive amount of disk space. I dedicated ~600gb to the images used for Batch1 and Batch2 testing. 
