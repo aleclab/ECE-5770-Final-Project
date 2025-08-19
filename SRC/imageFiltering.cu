@@ -344,51 +344,6 @@ static void sobel_fused_reflect101_rgb_cpu(
     }
 }
 
-// Separable Gaussian 1-D passes (K odd)
-template<int K, int CH>
-static void gauss1d_separable_reflect101_cpu(
-    const float* in, float* out,
-    int width, int height, int row_stride_elems,
-    const float* mask1d, // length K
-    int threads
-) {
-    std::vector<float> tmp((size_t)width * height * CH);
-
-    // Horizontal
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(threads)
-#endif
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            for (int c = 0; c < CH; ++c) {
-                float acc = 0.0f;
-                for (int k = 0; k < K; ++k) {
-                    int ix = reflect101(x + k - K / 2, width);
-                    acc += mask1d[k] * in[y * row_stride_elems + ix * CH + c];
-                }
-                tmp[y * row_stride_elems + x * CH + c] = clamp255_h(acc);
-            }
-        }
-    }
-
-    // Vertical
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(threads)
-#endif
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            for (int c = 0; c < CH; ++c) {
-                float acc = 0.0f;
-                for (int k = 0; k < K; ++k) {
-                    int iy = reflect101(y + k - K / 2, height);
-                    acc += mask1d[k] * tmp[iy * row_stride_elems + x * CH + c];
-                }
-                out[y * row_stride_elems + x * CH + c] = clamp255_h(acc);
-            }
-        }
-    }
-}
-
 
 enum Backend { BK_CUDA, BK_CPU, BK_MT };
 
@@ -1025,7 +980,7 @@ int main(int argc, char* argv[]) {
     static const float h_sobelY[9] = { 1.f, 2.f, 1.f,   0.f, 0.f, 0.f,  -1.f,-2.f,-1.f };
 
     // ========================= CPU / CPU-MT BACKEND =========================
-    // (Unchanged) — only runs when NOT CUDA and NOT NPP
+    // (Unchanged) Â— only runs when NOT CUDA and NOT NPP
     if ((backend != BK_CUDA) && !backendIsNPP) {
         std::vector<float> in(nElems), out(nElems);
 
